@@ -416,6 +416,13 @@
     }
 
     async function startCamera() {
+        // Attempt to enter fullscreen
+        if (document.documentElement.requestFullscreen) {
+            document.documentElement.requestFullscreen().catch(e => console.log("Fullscreen blocked:", e));
+        } else if (document.documentElement.webkitRequestFullscreen) {
+            document.documentElement.webkitRequestFullscreen();
+        }
+
         try {
             // Request landscape video preferred
             const stream = await navigator.mediaDevices.getUserMedia({
