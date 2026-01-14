@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>AI Driving Assistant v6.0 (Mobile)</title>
+    <title>AI Driving Assistant v6.0 (Mobile Pro)</title>
     <!-- Load TensorFlow.js and Coco-SSD -->
     <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest/dist/tf.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
@@ -20,6 +20,7 @@
             position: relative;
             width: 100vw;
             height: 100vh;
+            background: #000;
         }
 
         video {
@@ -41,27 +42,48 @@
             z-index: 2;
         }
 
+        /* Lane detection processing canvas (hidden) */
+        #proc-canvas {
+            display: none;
+        }
+
+        #ui-layer {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 10;
+            pointer-events: none;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+        }
+
         #loading {
             position: absolute;
             top: 50%;
             left: 50%;
             transform: translate(-50%, -50%);
-            z-index: 10;
+            z-index: 20;
             text-align: center;
             background: rgba(0, 0, 0, 0.85);
-            padding: 20px;
-            border-radius: 12px;
+            padding: 30px;
+            border-radius: 16px;
             border: 1px solid #444;
+            pointer-events: auto;
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
         }
 
         .spinner {
-            width: 40px;
-            height: 40px;
-            border: 4px solid #333;
-            border-top: 4px solid #00d2ff;
+            width: 50px;
+            height: 50px;
+            border: 5px solid #333;
+            border-top: 5px solid #00d2ff;
             border-radius: 50%;
             animation: spin 1s linear infinite;
-            margin: 0 auto 15px auto;
+            margin: 0 auto 20px auto;
         }
 
         @keyframes spin {
@@ -73,107 +95,329 @@
             background: #00d2ff;
             color: #000;
             border: none;
-            padding: 12px 24px;
-            font-size: 16px;
+            padding: 15px 30px;
+            font-size: 18px;
             font-weight: bold;
-            border-radius: 25px;
+            border-radius: 30px;
             cursor: pointer;
-            margin-top: 10px;
+            margin-top: 15px;
+            transition: transform 0.2s;
         }
+        
+        button:active { transform: scale(0.95); }
 
-        #debug {
+        /* Orientation Warning */
+        #landscape-warning {
+            display: none;
             position: absolute;
-            top: 10px;
-            left: 10px;
-            z-index: 20;
-            font-size: 10px;
-            color: lime;
-            pointer-events: none;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: #000;
+            z-index: 100;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+        }
+        
+        @media screen and (orientation: portrait) {
+            #landscape-warning { display: flex; }
+            #loading { display: none; } /* Hide loading in portrait to avoid clutter */
         }
     </style>
 </head>
 <body>
 
+<div id="landscape-warning">
+    <div style="font-size: 40px; margin-bottom: 20px;">⟳</div>
+    <h2>Please Rotate Device</h2>
+    <p>Landscape mode required for driving view</p>
+</div>
+
 <div id="container">
     <video id="video" playsinline muted></video>
     <canvas id="hud"></canvas>
+    <canvas id="proc-canvas" width="160" height="90"></canvas> <!-- Low res for processing -->
     
     <div id="loading">
         <div class="spinner"></div>
-        <h3 id="statusText">Initializing AI...</h3>
-        <p style="color: #aaa; font-size: 12px; margin-bottom: 15px;">Requires Camera Access</p>
-        <button id="startBtn" style="display:none">START SYSTEM</button>
+        <h3 id="statusText">Initializing Neural Engine...</h3>
+        <p style="color: #aaa; font-size: 14px; margin-bottom: 20px;">Requires Camera Access</p>
+        <button id="startBtn" style="display:none">ENGAGE SYSTEM</button>
     </div>
-    
-    <div id="debug"></div>
 </div>
 
 <script>
-    // Configuration
+    /**
+     * AI Driving Assistant v6.0 - Mobile Optimized
+     * Features: Kalman Filter, SORT Tracking, Lane Detection, HUD
+     */
+
+    // --- Configuration ---
     const CONFIG = {
-        CONFIDENCE_THRESHOLD: 0.45, // Higher for mobile to reduce noise
-        DANGER_ZONE_WIDTH: 0.35,    // Center 35% of screen
-        CRITICAL_AREA: 0.20,        // Area % to trigger critical warning
-        HIGH_AREA: 0.10,
-        MEDIUM_AREA: 0.04
+        CONFIDENCE: 0.40,
+        IOU_THRESHOLD: 0.3,
+        TRACK_MAX_AGE: 15,    // Frames to keep lost track (Ghost detection)
+        TRACK_MIN_HITS: 3,    // Min frames to confirm object
+        SMOOTHING: 0.6,       // EMA alpha (lower = smoother)
+        LANE_SENSITIVITY: 30, // Threshold for lane brightness
+        // Classes to track
+        CLASSES: ['person', 'bicycle', 'car', 'motorcycle', 'bus', 'truck', 'dog', 'horse', 'sheep', 'cow'],
+        // Real-world widths for distance estimation (meters)
+        WIDTHS: {
+            'person': 0.5, 'bicycle': 0.6, 'car': 1.8, 'motorcycle': 0.8,
+            'bus': 2.5, 'truck': 2.5, 'dog': 0.4, 'horse': 0.6, 'cow': 0.8
+        }
     };
 
-    // Colors
     const COLORS = {
-        CYAN: '#00d2ff',
-        GREEN: '#64e664',
-        YELLOW: '#ffe664',
-        ORANGE: '#ffb450',
-        RED: '#ff5050',
-        WHITE: '#ffffff',
-        GRAY: 'rgba(128, 128, 128, 0.5)',
-        BLACK_BG: 'rgba(0, 0, 0, 0.6)'
+        CYAN: '#00d2ff', GREEN: '#64e664', YELLOW: '#ffe664', 
+        ORANGE: '#ffb450', RED: '#ff5050', WHITE: '#ffffff',
+        DARK: 'rgba(20, 20, 30, 0.85)',
+        PEDESTRIAN: '#ff64b4'
     };
 
-    // State
+    // --- Math & Helper Classes ---
+
+    class SimpleKalmanFilter {
+        constructor(initialValue, processNoise = 0.1, measurementNoise = 0.1) {
+            this.x = initialValue; // State
+            this.p = 1.0;          // Covariance
+            this.q = processNoise; // Process noise
+            this.r = measurementNoise; // Measurement noise
+            this.k = 0.0;          // Kalman gain
+        }
+
+        update(measurement) {
+            // Prediction update
+            this.p = this.p + this.q;
+            
+            // Measurement update
+            this.k = this.p / (this.p + this.r);
+            this.x = this.x + this.k * (measurement - this.x);
+            this.p = (1 - this.k) * this.p;
+            return this.x;
+        }
+        
+        predict() {
+            // Simple constant velocity model implied by holding state
+            return this.x;
+        }
+    }
+
+    class TrackedObject {
+        constructor(id, detection) {
+            this.id = id;
+            this.class = detection.class;
+            this.label = detection.class.toUpperCase();
+            
+            // Kalman filters for bounding box (x, y, w, h)
+            const [x, y, w, h] = detection.bbox;
+            this.kx = new SimpleKalmanFilter(x);
+            this.ky = new SimpleKalmanFilter(y);
+            this.kw = new SimpleKalmanFilter(w);
+            this.kh = new SimpleKalmanFilter(h);
+            
+            this.bbox = [x, y, w, h];
+            this.score = detection.score;
+            this.age = 0;           // Frames since first seen
+            this.hits = 1;          // Times seen
+            this.timeSinceUpdate = 0;
+            
+            this.history = [];      // For motion trails
+            this.threatLevel = 0;
+            this.distance = 0;
+        }
+
+        update(detection) {
+            this.timeSinceUpdate = 0;
+            this.hits++;
+            this.age++;
+            
+            const [x, y, w, h] = detection.bbox;
+            this.bbox[0] = this.kx.update(x);
+            this.bbox[1] = this.ky.update(y);
+            this.bbox[2] = this.kw.update(w);
+            this.bbox[3] = this.kh.update(h);
+            this.score = detection.score; // Simple update
+
+            // Update history
+            const cx = this.bbox[0] + this.bbox[2]/2;
+            const cy = this.bbox[1] + this.bbox[3]/2;
+            this.history.push({x: cx, y: cy});
+            if (this.history.length > 15) this.history.shift();
+        }
+
+        predict() {
+            this.age++;
+            this.timeSinceUpdate++;
+            // Predict based on previous state
+            if (this.timeSinceUpdate > 0) {
+                this.bbox[0] = this.kx.predict();
+                this.bbox[1] = this.ky.predict();
+                this.bbox[2] = this.kw.predict();
+                this.bbox[3] = this.kh.predict();
+            }
+        }
+    }
+
+    class Tracker {
+        constructor() {
+            this.tracks = [];
+            this.nextId = 1;
+        }
+
+        update(detections) {
+            // 1. Predict existing tracks
+            this.tracks.forEach(t => t.predict());
+
+            // 2. Associate detections to tracks using IoU
+            const unmatchedTracks = new Set(this.tracks.map((t, i) => i));
+            const unmatchedDets = new Set(detections.map((d, i) => i));
+
+            // Greedy matching
+            for (let i = 0; i < this.tracks.length; i++) {
+                let bestIoU = 0;
+                let bestDetIdx = -1;
+
+                for (let j = 0; j < detections.length; j++) {
+                    if (!unmatchedDets.has(j)) continue;
+                    
+                    // Only match same class
+                    if (this.tracks[i].class !== detections[j].class) continue;
+
+                    const iou = this.calculateIoU(this.tracks[i].bbox, detections[j].bbox);
+                    if (iou > bestIoU) {
+                        bestIoU = iou;
+                        bestDetIdx = j;
+                    }
+                }
+
+                if (bestIoU >= CONFIG.IOU_THRESHOLD) {
+                    this.tracks[i].update(detections[bestDetIdx]);
+                    unmatchedTracks.delete(i);
+                    unmatchedDets.delete(bestDetIdx);
+                }
+            }
+
+            // 3. Create new tracks
+            unmatchedDets.forEach(idx => {
+                this.tracks.push(new TrackedObject(this.nextId++, detections[idx]));
+            });
+
+            // 4. Remove dead tracks
+            this.tracks = this.tracks.filter((t, i) => {
+                // Remove if not matched this frame AND exceeds max age
+                if (unmatchedTracks.has(i) && t.timeSinceUpdate > CONFIG.TRACK_MAX_AGE) return false;
+                return true;
+            });
+
+            return this.tracks.filter(t => t.hits >= CONFIG.TRACK_MIN_HITS || t.timeSinceUpdate === 0);
+        }
+
+        calculateIoU(boxA, boxB) {
+            const xA = Math.max(boxA[0], boxB[0]);
+            const yA = Math.max(boxA[1], boxB[1]);
+            const xB = Math.min(boxA[0] + boxA[2], boxB[0] + boxB[2]);
+            const yB = Math.min(boxA[1] + boxA[3], boxB[1] + boxB[3]);
+
+            const interArea = Math.max(0, xB - xA) * Math.max(0, yB - yA);
+            const boxAArea = boxA[2] * boxA[3];
+            const boxBArea = boxB[2] * boxB[3];
+
+            return interArea / (boxAArea + boxBArea - interArea);
+        }
+    }
+
+    class LaneScanner {
+        constructor() {
+            this.canvas = document.getElementById('proc-canvas');
+            this.ctx = this.canvas.getContext('2d', { willReadFrequently: true });
+            this.offset = 0; // -1 (left) to 1 (right)
+            this.detected = false;
+        }
+
+        scan(videoElement) {
+            // Draw small version of frame
+            this.ctx.drawImage(videoElement, 0, 0, 160, 90);
+            
+            // Scan bottom 20% of image
+            const imageData = this.ctx.getImageData(0, 70, 160, 20);
+            const data = imageData.data;
+            let leftLaneX = -1;
+            let rightLaneX = -1;
+            const center = 80;
+
+            // Simple bright spot detection in two zones
+            // Scan for Left Lane (0-70)
+            for (let x = 70; x > 10; x--) {
+                if (this.isRoadLine(data, x, 10, 160)) { leftLaneX = x; break; }
+            }
+            // Scan for Right Lane (90-150)
+            for (let x = 90; x < 150; x++) {
+                if (this.isRoadLine(data, x, 10, 160)) { rightLaneX = x; break; }
+            }
+
+            this.detected = (leftLaneX > 0 || rightLaneX > 0);
+            
+            if (leftLaneX > 0 && rightLaneX > 0) {
+                const laneCenter = (leftLaneX + rightLaneX) / 2;
+                this.offset = (laneCenter - center) / center; // Normalized offset
+            } else {
+                // Decay offset
+                this.offset = this.offset * 0.9;
+            }
+            return { detected: this.detected, offset: this.offset };
+        }
+
+        isRoadLine(data, x, y, width) {
+            const i = (y * width + x) * 4;
+            // High brightness and low saturation (white/yellowish)
+            const r = data[i], g = data[i+1], b = data[i+2];
+            return (r > 160 && g > 160 && b > 160);
+        }
+    }
+
+    // --- Main App Logic ---
+
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('hud');
+    const ctx = canvas.getContext('2d');
+    const loading = document.getElementById('loading');
+    const statusText = document.getElementById('statusText');
+    const startBtn = document.getElementById('startBtn');
+
     let model = null;
+    let tracker = new Tracker();
+    let laneScanner = new LaneScanner();
     let isRunning = false;
-    let video = document.getElementById('video');
-    let canvas = document.getElementById('hud');
-    let ctx = canvas.getContext('2d');
-    let startBtn = document.getElementById('startBtn');
-    let statusText = document.getElementById('statusText');
-    let loadingDiv = document.getElementById('loading');
+    let frameCount = 0;
     
-    // Smooth instruction state
-    let currentInstruction = {
-        main: "READY",
-        sub: "System Online",
-        color: COLORS.CYAN
-    };
-
-    // FPS Calculation
-    let lastFrameTime = 0;
-    let fps = 0;
-
-    // --- initialization ---
+    // UI State
+    let instruction = { text: "READY", sub: "System Online", color: COLORS.CYAN };
+    let fps = 0, lastTime = 0;
 
     async function init() {
         try {
-            statusText.innerText = "Loading Model...";
-            // Load Coco-SSD (Lightweight version of YOLO logic)
+            statusText.innerText = "Loading AI Core...";
+            // Load efficient mobile model
             model = await cocoSsd.load({ base: 'lite_mobilenet_v2' });
             
             statusText.innerText = "System Ready";
             document.querySelector('.spinner').style.display = 'none';
             startBtn.style.display = 'inline-block';
-            
             startBtn.addEventListener('click', startCamera);
-        } catch (err) {
-            statusText.innerText = "Error Loading AI";
-            console.error(err);
-            alert("Failed to load AI model. Make sure you are online.");
+        } catch (e) {
+            statusText.innerText = "Initialization Failed";
+            alert("Error: " + e.message);
         }
     }
 
     async function startCamera() {
-        statusText.innerText = "Accessing Camera...";
         try {
+            // Request landscape video preferred
             const stream = await navigator.mediaDevices.getUserMedia({
                 video: {
                     facingMode: 'environment',
@@ -184,266 +428,321 @@
             });
             
             video.srcObject = stream;
-            
             video.onloadedmetadata = () => {
                 video.play();
-                loadingDiv.style.display = 'none';
-                resizeCanvas();
+                loading.style.display = 'none';
+                resize();
                 isRunning = true;
                 requestAnimationFrame(loop);
             };
-        } catch (err) {
-            console.error(err);
-            alert("Camera access denied or failed. Please check permissions and ensure you are using HTTPS.");
-            statusText.innerText = "Camera Error";
+        } catch (e) {
+            alert("Camera Access Denied. Please enable permissions.");
         }
     }
 
-    function resizeCanvas() {
+    function resize() {
         canvas.width = window.innerWidth;
         canvas.height = window.innerHeight;
     }
-
-    window.addEventListener('resize', resizeCanvas);
-
-    // --- Core Logic ---
+    window.addEventListener('resize', resize);
 
     async function loop(timestamp) {
         if (!isRunning) return;
 
-        // Calculate FPS
-        const delta = timestamp - lastFrameTime;
+        // FPS Calc
+        const delta = timestamp - lastTime;
         fps = 1000 / delta;
-        lastFrameTime = timestamp;
+        lastTime = timestamp;
+        frameCount++;
 
-        // 1. Detect Objects
-        // We only look for traffic related classes
-        const predictions = await model.detect(video, 5, CONFIG.CONFIDENCE_THRESHOLD);
+        // 1. Detection (Run every frame for responsiveness on modern phones)
+        const predictions = await model.detect(video, 5, CONFIG.CONFIDENCE);
         
-        const relevantClasses = ['person', 'bicycle', 'car', 'motorcycle', 'bus', 'truck', 'dog', 'horse', 'sheep', 'cow'];
-        const detections = predictions.filter(p => relevantClasses.includes(p.class));
+        // Filter relevant classes
+        const validDets = predictions.filter(p => CONFIG.CLASSES.includes(p.class));
+        
+        // 2. Tracking (SORT + Kalman)
+        const tracks = tracker.update(validDets);
 
-        // 2. Clear & Draw Video Frame (if needed, but video element is behind)
+        // 3. Lane Detection (Heuristic)
+        const laneData = laneScanner.scan(video);
+
+        // 4. Logic & Safety Analysis
+        analyzeScene(tracks, laneData);
+
+        // 5. Render HUD
         ctx.clearRect(0, 0, canvas.width, canvas.height);
-        
-        // 3. Analyze Scene
-        const analysis = analyzeScene(detections);
-        updateInstruction(analysis);
-
-        // 4. Render HUD
-        drawRoadOverlay();
-        drawDetections(detections);
-        drawHUD(analysis);
+        drawHUD(tracks, laneData);
 
         requestAnimationFrame(loop);
     }
 
-    function analyzeScene(detections) {
-        const width = canvas.width;
-        const height = canvas.height;
-        const area = width * height;
-        
-        let maxThreat = 0; // 0: None, 1: Low, 2: Med, 3: High, 4: Critical
+    function analyzeScene(tracks, laneData) {
+        let maxThreat = 0;
         let criticalObj = null;
+        const w = canvas.width;
+        const h = canvas.height;
+        const centerZone = w * 0.35; // Center 35%
+        const centerX = w / 2;
 
-        // Determine Center Zone
-        const centerLeft = width * (0.5 - CONFIG.DANGER_ZONE_WIDTH / 2);
-        const centerRight = width * (0.5 + CONFIG.DANGER_ZONE_WIDTH / 2);
+        tracks.forEach(t => {
+            const [x, y, bw, bh] = t.bbox;
+            const cx = x + bw/2;
+            const cy = y + bh/2;
+            
+            // Heuristic Distance
+            const realW = CONFIG.WIDTHS[t.class] || 1.0;
+            // Estimated distance in meters (calibrated roughly for phone FOV)
+            t.distance = (realW * 800) / bw; 
 
-        detections.forEach(det => {
-            const [x, y, w, h] = det.bbox;
-            const cx = x + w/2;
-            const cy = y + h/2;
-            const relArea = (w * h) / (video.videoWidth * video.videoHeight); // Use video dims for consistent area
-            
-            // Map video coords to canvas if needed (usually handled by CSS scaling, but bbox is video-relative)
-            // We'll normalize for logic
-            
+            // Threat Logic
             let threat = 0;
-            let pos = "SIDE";
-
-            if (cx > centerLeft && cx < centerRight) {
-                pos = "CENTER";
-                if (relArea > CONFIG.CRITICAL_AREA) threat = 4;
-                else if (relArea > CONFIG.HIGH_AREA) threat = 3;
-                else if (relArea > CONFIG.MEDIUM_AREA) threat = 2;
+            const isCenter = Math.abs(cx - centerX) < centerZone;
+            
+            if (isCenter) {
+                if (t.distance < 15) threat = 4; // Critical
+                else if (t.distance < 30) threat = 3; // High
+                else if (t.distance < 50) threat = 2; // Medium
                 else threat = 1;
             } else {
-                if (relArea > CONFIG.HIGH_AREA) threat = 2; // Close but side
-            }
-            
-            // Boost threat for vulnerable road users
-            if (['person', 'bicycle', 'dog', 'horse'].includes(det.class) && pos === "CENTER" && threat > 0) {
-                threat = Math.min(threat + 1, 4);
+                if (t.distance < 10) threat = 2; // Close side object
             }
 
-            det.threatLevel = threat;
-            det.relArea = relArea;
-            
+            // Pedestrian Boost
+            if (t.class === 'person' && threat > 0) threat = Math.min(4, threat + 1);
+
+            t.threatLevel = threat;
             if (threat > maxThreat) {
                 maxThreat = threat;
-                criticalObj = det;
+                criticalObj = t;
             }
         });
 
-        // Generate Instruction
-        let main = "CLEAR";
-        let sub = "Road ahead is clear";
-        let color = COLORS.CYAN;
-
-        if (maxThreat >= 4) {
-            main = "⚠ BRAKE";
-            sub = `Collision Warning: ${criticalObj.class.toUpperCase()}`;
-            color = COLORS.RED;
-        } else if (maxThreat === 3) {
-            main = "SLOW DOWN";
-            sub = `Approaching ${criticalObj.class}`;
-            color = COLORS.ORANGE;
-        } else if (maxThreat === 2) {
-            main = "CAUTION";
-            sub = `Traffic Ahead`;
-            color = COLORS.YELLOW;
+        // Lane Drift Logic
+        if (maxThreat < 3 && laneData.detected) {
+            if (laneData.offset < -0.3) {
+                instruction = { text: "DRIFTING LEFT", sub: "Correct Right", color: COLORS.YELLOW };
+                return;
+            } else if (laneData.offset > 0.3) {
+                instruction = { text: "DRIFTING RIGHT", sub: "Correct Left", color: COLORS.YELLOW };
+                return;
+            }
         }
 
-        return { main, sub, color, maxThreat };
-    }
-
-    function updateInstruction(analysis) {
-        // Simple smoothing
-        if (analysis.maxThreat >= 3) {
-            // Instant update for danger
-            currentInstruction = analysis;
+        // Object Warning Logic
+        if (maxThreat >= 4) {
+            instruction = { 
+                text: "⚠ BRAKE", 
+                sub: `Collision Warning: ${criticalObj.label}`, 
+                color: COLORS.RED 
+            };
+        } else if (maxThreat === 3) {
+            instruction = { 
+                text: "SLOW DOWN", 
+                sub: `Approaching ${criticalObj.label}`, 
+                color: COLORS.ORANGE 
+            };
         } else {
-            // Slight delay/hysteresis could be added here, but direct is fine for mobile
-            currentInstruction = analysis;
+            instruction = { 
+                text: "CLEAR", 
+                sub: `Tracking ${tracks.length} Objects`, 
+                color: COLORS.CYAN 
+            };
         }
     }
 
     // --- Rendering ---
 
-    function drawRoadOverlay() {
+    function drawHUD(tracks, laneData) {
         const w = canvas.width;
         const h = canvas.height;
-        const cy = h / 2;
         
-        // Draw static perspective lines (Sci-fi road)
-        ctx.beginPath();
-        ctx.strokeStyle = 'rgba(0, 210, 255, 0.3)';
-        ctx.lineWidth = 2;
-        // Left line
-        ctx.moveTo(w * 0.45, cy);
-        ctx.lineTo(0, h);
-        // Right line
-        ctx.moveTo(w * 0.55, cy);
-        ctx.lineTo(w, h);
-        ctx.stroke();
+        // 1. Road Overlay (Perspective)
+        drawRoad(w, h, laneData);
 
-        // Center crosshair
-        ctx.strokeStyle = COLORS.CYAN;
-        ctx.lineWidth = 1;
-        const size = 20;
-        ctx.beginPath();
-        ctx.moveTo(w/2 - size, cy);
-        ctx.lineTo(w/2 + size, cy);
-        ctx.moveTo(w/2, cy - size);
-        ctx.lineTo(w/2, cy + size);
-        ctx.stroke();
-    }
-
-    function drawDetections(detections) {
-        // Scale factors
-        const scaleX = canvas.width / video.videoWidth;
-        const scaleY = canvas.height / video.videoHeight;
-
-        detections.forEach(det => {
-            const [x, y, w, h] = det.bbox;
-            const sx = x * scaleX;
-            const sy = y * scaleY;
-            const sw = w * scaleX;
-            const sh = h * scaleY;
-
-            let color = COLORS.CYAN;
-            if (det.threatLevel === 4) color = COLORS.RED;
-            else if (det.threatLevel === 3) color = COLORS.ORANGE;
-            else if (det.threatLevel === 2) color = COLORS.YELLOW;
-            else if (det.class === 'person') color = '#ff00ff';
-
-            // Box
-            ctx.strokeStyle = color;
-            ctx.lineWidth = 2;
-            ctx.strokeRect(sx, sy, sw, sh);
-
-            // Label Background
-            ctx.fillStyle = color;
-            const label = `${det.class.toUpperCase()} ${(det.score*100).toFixed(0)}%`;
-            const textWidth = ctx.measureText(label).width;
+        // 2. Object Overlays
+        tracks.forEach(t => {
+            // Scale coords from video to canvas
+            const scaleX = w / video.videoWidth;
+            const scaleY = h / video.videoHeight;
             
-            ctx.fillRect(sx, sy - 20, textWidth + 10, 20);
+            let [bx, by, bw, bh] = t.bbox;
+            bx *= scaleX; by *= scaleY; bw *= scaleX; bh *= scaleY;
             
-            // Label Text
-            ctx.fillStyle = '#000';
-            ctx.font = 'bold 12px sans-serif';
-            ctx.fillText(label, sx + 5, sy - 5);
+            const color = t.threatLevel >= 4 ? COLORS.RED : 
+                          t.threatLevel === 3 ? COLORS.ORANGE : 
+                          t.class === 'person' ? COLORS.PEDESTRIAN : COLORS.CYAN;
 
-            // Distance Arc (Fake distance based on position)
-            if (det.threatLevel > 1) {
-                const bottomY = sy + sh;
+            // Motion Trail
+            if (t.history.length > 2) {
                 ctx.beginPath();
                 ctx.strokeStyle = color;
                 ctx.lineWidth = 2;
-                ctx.arc(canvas.width/2, bottomY, 10 + (sw/4), Math.PI, 0); // Simple arc visualization
+                t.history.forEach((pt, i) => {
+                    const px = pt.x * scaleX;
+                    const py = pt.y * scaleY;
+                    if (i===0) ctx.moveTo(px, py);
+                    else ctx.lineTo(px, py);
+                });
                 ctx.stroke();
             }
+
+            // Bounding Box (Corners only for style)
+            drawBracketBox(ctx, bx, by, bw, bh, color);
+
+            // Label
+            const cx = bx + bw/2;
+            const cy = by + bh/2;
+            
+            ctx.fillStyle = color;
+            ctx.font = "bold 12px monospace";
+            const labelTxt = `${t.label} ${t.distance.toFixed(0)}m`;
+            const tm = ctx.measureText(labelTxt);
+            
+            // Label Pill
+            ctx.fillRect(bx, by - 16, tm.width + 10, 16);
+            ctx.fillStyle = "#000";
+            ctx.fillText(labelTxt, bx + 5, by - 4);
+
+            // Distance Arc (Floor projection)
+            if (t.threatLevel > 1) {
+                ctx.beginPath();
+                ctx.strokeStyle = color;
+                ctx.globalAlpha = 0.6;
+                ctx.arc(w/2, by + bh, bw * 0.5, Math.PI, 0);
+                ctx.stroke();
+                ctx.globalAlpha = 1.0;
+            }
+        });
+
+        // 3. Mini Map (Radar)
+        drawRadar(w, h, tracks);
+
+        // 4. Interface (Top/Bottom Bars)
+        drawInterface(w, h);
+    }
+
+    function drawRoad(w, h, laneData) {
+        const cy = h * 0.5;
+        const bottomW = w * 0.8;
+        const topW = w * 0.1;
+        
+        ctx.save();
+        // Lane guides
+        ctx.beginPath();
+        const offset = laneData.offset * 200; // Visual shift based on drift
+        
+        ctx.moveTo(w/2 - topW + offset/4, cy);
+        ctx.lineTo(w/2 - bottomW + offset, h);
+        
+        ctx.moveTo(w/2 + topW + offset/4, cy);
+        ctx.lineTo(w/2 + bottomW + offset, h);
+        
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = laneData.detected ? COLORS.GREEN : 'rgba(0, 210, 255, 0.2)';
+        ctx.setLineDash(laneData.detected ? [] : [10, 20]);
+        ctx.stroke();
+        ctx.restore();
+    }
+
+    function drawBracketBox(ctx, x, y, w, h, color) {
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2;
+        const len = Math.min(w, h) * 0.2;
+        
+        ctx.beginPath();
+        // TL
+        ctx.moveTo(x, y + len); ctx.lineTo(x, y); ctx.lineTo(x + len, y);
+        // TR
+        ctx.moveTo(x + w - len, y); ctx.lineTo(x + w, y); ctx.lineTo(x + w, y + len);
+        // BR
+        ctx.moveTo(x + w, y + h - len); ctx.lineTo(x + w, y + h); ctx.lineTo(x + w - len, y + h);
+        // BL
+        ctx.moveTo(x + len, y + h); ctx.lineTo(x, y + h); ctx.lineTo(x, y + h - len);
+        ctx.stroke();
+    }
+
+    function drawRadar(w, h, tracks) {
+        const mapSize = 100;
+        const mx = w - mapSize - 20;
+        const my = 70;
+        
+        // Radar BG
+        ctx.fillStyle = "rgba(0, 20, 30, 0.5)";
+        ctx.fillRect(mx, my, mapSize, mapSize);
+        ctx.strokeStyle = COLORS.CYAN;
+        ctx.lineWidth = 1;
+        ctx.strokeRect(mx, my, mapSize, mapSize);
+        
+        // Ego Vehicle
+        ctx.fillStyle = COLORS.WHITE;
+        ctx.beginPath();
+        ctx.moveTo(mx + mapSize/2, my + mapSize - 5);
+        ctx.lineTo(mx + mapSize/2 - 5, my + mapSize + 5);
+        ctx.lineTo(mx + mapSize/2 + 5, my + mapSize + 5);
+        ctx.fill();
+
+        // Objects
+        tracks.forEach(t => {
+            // Map distance 0-100m to radar height
+            const rY = Math.max(0, Math.min(mapSize, (t.distance / 80) * mapSize));
+            // Map X position relative to center
+            // Simple heuristic mapping
+            const vidW = video.videoWidth || 1280;
+            const rX = ((t.bbox[0] + t.bbox[2]/2) / vidW - 0.5) * mapSize * 1.5;
+            
+            ctx.fillStyle = t.threatLevel >= 3 ? COLORS.RED : COLORS.CYAN;
+            ctx.beginPath();
+            ctx.arc(mx + mapSize/2 + rX, my + mapSize - rY, 3, 0, Math.PI*2);
+            ctx.fill();
         });
     }
 
-    function drawHUD(analysis) {
-        const w = canvas.width;
-        const h = canvas.height;
-
+    function drawInterface(w, h) {
         // Top Bar
-        ctx.fillStyle = 'rgba(0,0,0,0.5)';
-        ctx.fillRect(0, 0, w, 60);
-        
+        ctx.fillStyle = COLORS.DARK;
+        ctx.fillRect(0, 0, w, 50);
         ctx.fillStyle = COLORS.CYAN;
-        ctx.font = '14px monospace';
-        ctx.fillText("AI DRIVING ASSISTANT", 20, 35);
+        ctx.font = "bold 16px sans-serif";
+        ctx.fillText("AI PILOT v6.0", 20, 32);
         
+        ctx.textAlign = "right";
         ctx.fillStyle = fps > 20 ? COLORS.GREEN : COLORS.RED;
-        ctx.textAlign = 'right';
-        ctx.fillText(`FPS: ${fps.toFixed(0)}`, w - 20, 35);
+        ctx.fillText(`FPS: ${fps.toFixed(0)}`, w - 20, 32);
 
-        // Bottom Panel
-        const panelH = 100;
-        ctx.fillStyle = 'linear-gradient(to top, rgba(0,0,0,0.9), transparent)'; // Not supported in canvas fillStyle directly like CSS, approximating
-        ctx.fillStyle = 'rgba(0,0,0,0.8)';
-        ctx.fillRect(0, h - panelH, w, panelH);
-        
-        // Dynamic Border
-        ctx.strokeStyle = analysis.color;
+        // Bottom Warning Panel
+        const panelH = 90;
+        const grad = ctx.createLinearGradient(0, h-panelH, 0, h);
+        grad.addColorStop(0, "rgba(0,0,0,0)");
+        grad.addColorStop(0.5, "rgba(0,0,0,0.8)");
+        ctx.fillStyle = grad;
+        ctx.fillRect(0, h-panelH, w, panelH);
+
+        // Status Line
+        ctx.strokeStyle = instruction.color;
         ctx.lineWidth = 4;
         ctx.beginPath();
-        ctx.moveTo(0, h - panelH);
-        ctx.lineTo(w, h - panelH);
+        ctx.moveTo(0, h-panelH);
+        ctx.lineTo(w, h-panelH);
         ctx.stroke();
 
-        // Main Instruction
-        ctx.textAlign = 'center';
-        ctx.fillStyle = analysis.color;
-        ctx.font = 'bold 36px sans-serif';
-        // Add glow
-        ctx.shadowColor = analysis.color;
+        // Text
+        ctx.textAlign = "center";
+        ctx.fillStyle = instruction.color;
+        ctx.font = "bold 32px sans-serif";
+        ctx.shadowColor = instruction.color;
         ctx.shadowBlur = 10;
-        ctx.fillText(currentInstruction.main, w/2, h - 55);
+        ctx.fillText(instruction.text, w/2, h - 45);
         ctx.shadowBlur = 0;
-
-        // Sub Text
+        
         ctx.fillStyle = COLORS.WHITE;
-        ctx.font = '16px sans-serif';
-        ctx.fillText(currentInstruction.sub, w/2, h - 25);
+        ctx.font = "16px sans-serif";
+        ctx.fillText(instruction.sub, w/2, h - 20);
+        
+        // Reset Align
+        ctx.textAlign = "left";
     }
 
-    // Start
     init();
 
 </script>
