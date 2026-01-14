@@ -8,7 +8,7 @@ import math
 import time
 from datetime import datetime
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict
 from enum import Enum
 import warnings
@@ -22,45 +22,50 @@ warnings.filterwarnings('ignore')
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class Config:
-    # ─── Video Source ───
+    # Video Source
     USE_TEST_VIDEO: bool = True
-    TEST_VIDEO_PATH: str = "test3.mp4"
+    TEST_VIDEO_PATH: str = "test.mp4"
     LIVE_CAMERA_INDEX: int = 0
     
-    # ─── Output ───
+    # Output
     SAVE_OUTPUT: bool = True
-    OUTPUT_PATH: str = "output_final.mp4"
+    OUTPUT_PATH: str = "output_v9.mp4"
     
-    # ─── Model ───
+    # Model
     YOLO_MODEL: str = "yolov8s-seg.pt"
-    CONFIDENCE_THRESHOLD: float = 0.40
+    CONFIDENCE: float = 0.35
     
-    # ─── Detection Zones ───
-    LEFT_ZONE_END: float = 0.38
-    RIGHT_ZONE_START: float = 0.62
-    
-    # ─── Object Classes ───
+    # Object Classes
     ALL_CLASSES: List[int] = [0, 1, 2, 3, 5, 7, 16, 17, 18, 19]
+    VEHICLE_CLASSES: List[int] = [1, 2, 3, 5, 7]  # bicycle, car, motorcycle, bus, truck
     PERSON_CLASSES: List[int] = [0]
     ANIMAL_CLASSES: List[int] = [16, 17, 18, 19]
     
-    # ─── Threat Thresholds ───
-    CRITICAL_AREA: float = 0.14
+    # Detection
+    SKY_CUTOFF: float = 0.28
+    MIN_AREA: float = 0.0008
+    MAX_AREA: float = 0.75
+    
+    # Our Lane - WIDER definition (25% to 75% of frame)
+    OUR_LANE_LEFT: float = 0.22
+    OUR_LANE_RIGHT: float = 0.78
+    
+    # Threat Distances (meters)
+    CRITICAL_DISTANCE: float = 5.0
+    CLOSE_DISTANCE: float = 12.0
+    MEDIUM_DISTANCE: float = 25.0
+    FAR_DISTANCE: float = 50.0
+    
+    # Threat Areas (relative to frame)
+    CRITICAL_AREA: float = 0.15
     HIGH_AREA: float = 0.06
-    MEDIUM_AREA: float = 0.02
+    MEDIUM_AREA: float = 0.025
     
-    # ─── Passing Logic ───
-    ENABLE_PASS_SUGGESTIONS: bool = True
-    MIN_PASS_DISTANCE: float = 15.0
-    REQUIRE_LANE_DETECTION: bool = True
+    # Passing
+    MIN_PASS_DISTANCE: float = 18.0
     
-    # ─── Filtering ───
-    SKY_CUTOFF: float = 0.25
-    MIN_AREA: float = 0.001
-    MAX_AREA: float = 0.80
-    
-    # ─── Visual ───
-    MASK_ALPHA: float = 0.40
+    # Visual
+    MASK_ALPHA: float = 0.38
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -68,7 +73,6 @@ class Config:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def get_device():
-    """Get best available compute device."""
     if torch.backends.mps.is_available():
         return "mps"
     elif torch.cuda.is_available():
@@ -77,34 +81,35 @@ def get_device():
 
 
 class Colors:
-    """Color definitions (BGR format)."""
-    # UI Colors
+    # Primary
     CYAN = (255, 220, 100)
     WHITE = (255, 255, 255)
     GREEN = (100, 230, 100)
     YELLOW = (80, 220, 255)
-    ORANGE = (80, 180, 255)
-    RED = (80, 80, 255)
+    ORANGE = (80, 165, 255)
+    RED = (70, 70, 240)
     
-    # Segmentation Colors
-    SEG_VEHICLE = (180, 140, 80)
+    # Segments
+    SEG_VEHICLE = (170, 140, 90)
+    SEG_LEAD = (100, 200, 120)      # Green tint for lead vehicle
     SEG_PERSON = (200, 100, 180)
     SEG_ANIMAL = (100, 180, 200)
     
-    # Neutral Colors
+    # UI
     LIGHT_GRAY = (200, 200, 200)
     GRAY = (140, 140, 140)
-    DARK_GRAY = (60, 60, 60)
-    NEAR_BLACK = (20, 20, 20)
+    DIM_GRAY = (100, 100, 100)
+    DARK_GRAY = (55, 55, 55)
+    NEAR_BLACK = (22, 22, 22)
     BLACK = (0, 0, 0)
     
-    # Road Colors
-    ROAD_SURFACE = (45, 45, 50)
-    ROAD_EDGE = (70, 70, 80)
+    # Road
+    ROAD = (42, 42, 48)
+    ROAD_EDGE = (65, 65, 75)
+    LANE_LINE = (190, 190, 190)
 
 
 class ThreatLevel(Enum):
-    """Threat level classification."""
     NONE = 0
     LOW = 1
     MEDIUM = 2
@@ -114,7 +119,6 @@ class ThreatLevel(Enum):
 
 @dataclass
 class Detection:
-    """Detection data structure."""
     bbox: Tuple[int, int, int, int]
     mask: Optional[np.ndarray]
     class_id: int
@@ -122,9 +126,10 @@ class Detection:
     confidence: float
     center: Tuple[int, int]
     area_ratio: float
-    zone: str
     distance: float
     threat: ThreatLevel
+    in_our_lane: bool = False
+    is_lead: bool = False
     is_confirmed: bool = True
     track_id: int = -1
     frames_seen: int = 1
@@ -132,90 +137,115 @@ class Detection:
 
 @dataclass
 class LaneInfo:
-    """Lane detection data."""
     left_line: Optional[List[Tuple[int, int]]] = None
     right_line: Optional[List[Tuple[int, int]]] = None
-    left_lane_found: bool = False
-    right_lane_found: bool = False
+    left_detected: bool = False
+    right_detected: bool = False
     center_offset: float = 0.0
-    valid: bool = False
+
+
+@dataclass
+class DrivingState:
+    """Current driving situation analysis."""
+    lead_vehicle: Optional[Detection] = None
+    left_traffic: List[Detection] = field(default_factory=list)
+    right_traffic: List[Detection] = field(default_factory=list)
+    pedestrians: List[Detection] = field(default_factory=list)
+    max_threat: ThreatLevel = ThreatLevel.NONE
+    road_clear: bool = True
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#                              OBJECT TRACKER
+#                              TRACKER
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class ObjectTracker:
-    """Simple centroid-based object tracker."""
-    
     def __init__(self):
-        self.objects: Dict[int, dict] = {}
+        self.tracks: Dict[int, dict] = {}
         self.next_id = 0
+        self.distance_history: Dict[int, deque] = {}
     
     def update(self, detections: List[Detection]) -> List[Detection]:
-        """Update tracks with new detections."""
-        current = [(d.center, d.class_id, i) for i, d in enumerate(detections)]
+        current = [(d.center, d.class_id, d.distance, i) for i, d in enumerate(detections)]
         
-        if not self.objects:
-            for center, cls_id, idx in current:
-                self.objects[self.next_id] = {
-                    'center': center, 'class': cls_id, 'frames': 1, 'missing': 0
-                }
-                detections[idx].track_id = self.next_id
-                detections[idx].frames_seen = 1
-                detections[idx].is_confirmed = False
-                self.next_id += 1
+        if not self.tracks:
+            for center, cls, dist, idx in current:
+                self._create_track(detections[idx], center, cls, dist)
             return detections
         
         used_det, used_track = set(), set()
         matches = []
         
-        for tid, track in self.objects.items():
-            for center, cls_id, idx in current:
-                dist = math.hypot(center[0] - track['center'][0], 
-                                 center[1] - track['center'][1])
-                if dist < 150:
-                    matches.append((dist, tid, idx, cls_id))
+        for tid, track in self.tracks.items():
+            for center, cls, dist, idx in current:
+                d = math.hypot(center[0] - track['center'][0], center[1] - track['center'][1])
+                if d < 150:
+                    matches.append((d, tid, idx, center, cls, dist))
         
         matches.sort(key=lambda x: x[0])
         
-        for dist, tid, idx, cls_id in matches:
+        for d, tid, idx, center, cls, dist in matches:
             if tid in used_track or idx in used_det:
                 continue
             
-            self.objects[tid].update({
-                'center': detections[idx].center,
-                'frames': self.objects[tid]['frames'] + 1,
-                'missing': 0,
-                'class': cls_id
+            self.tracks[tid].update({
+                'center': center, 'class': cls, 
+                'frames': self.tracks[tid]['frames'] + 1, 'missing': 0
             })
+            
+            # Track distance history for approach detection
+            if tid not in self.distance_history:
+                self.distance_history[tid] = deque(maxlen=15)
+            self.distance_history[tid].append(dist)
+            
             detections[idx].track_id = tid
-            detections[idx].frames_seen = self.objects[tid]['frames']
-            detections[idx].is_confirmed = self.objects[tid]['frames'] >= 2
+            detections[idx].frames_seen = self.tracks[tid]['frames']
+            detections[idx].is_confirmed = self.tracks[tid]['frames'] >= 2
+            
             used_track.add(tid)
             used_det.add(idx)
         
-        for center, cls_id, idx in current:
+        for center, cls, dist, idx in current:
             if idx not in used_det:
-                self.objects[self.next_id] = {
-                    'center': center, 'class': cls_id, 'frames': 1, 'missing': 0
-                }
-                detections[idx].track_id = self.next_id
-                detections[idx].frames_seen = 1
-                detections[idx].is_confirmed = False
-                self.next_id += 1
+                self._create_track(detections[idx], center, cls, dist)
         
+        # Age out old tracks
         expired = []
-        for tid in self.objects:
+        for tid in self.tracks:
             if tid not in used_track:
-                self.objects[tid]['missing'] += 1
-                if self.objects[tid]['missing'] > 8:
+                self.tracks[tid]['missing'] += 1
+                if self.tracks[tid]['missing'] > 10:
                     expired.append(tid)
-        
         for tid in expired:
-            del self.objects[tid]
+            del self.tracks[tid]
+            if tid in self.distance_history:
+                del self.distance_history[tid]
         
         return detections
+    
+    def _create_track(self, det, center, cls, dist):
+        self.tracks[self.next_id] = {
+            'center': center, 'class': cls, 'frames': 1, 'missing': 0
+        }
+        self.distance_history[self.next_id] = deque(maxlen=15)
+        self.distance_history[self.next_id].append(dist)
+        det.track_id = self.next_id
+        det.frames_seen = 1
+        det.is_confirmed = False
+        self.next_id += 1
+    
+    def is_approaching(self, track_id: int) -> bool:
+        """Check if object is getting closer."""
+        if track_id not in self.distance_history:
+            return False
+        hist = self.distance_history[track_id]
+        if len(hist) < 5:
+            return False
+        
+        # Compare recent average to older average
+        recent = sum(list(hist)[-3:]) / 3
+        older = sum(list(hist)[:3]) / 3
+        return recent < older - 1.5  # Getting closer by >1.5m
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -223,115 +253,101 @@ class ObjectTracker:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class DetectionEngine:
-    """YOLO-based segmentation detection engine."""
-    
     def __init__(self, width: int, height: int):
-        print("  Loading YOLO segmentation model...")
+        print("  Loading YOLO model...")
         self.device = get_device()
         print(f"  Device: {self.device.upper()}")
         
         self.model = YOLO(Config.YOLO_MODEL)
         self.w = width
         self.h = height
-        self.frame_area = width * height
+        self.area = width * height
         self.tracker = ObjectTracker()
         
-        self.left_boundary = int(width * Config.LEFT_ZONE_END)
-        self.right_boundary = int(width * Config.RIGHT_ZONE_START)
-        self.sky_line = int(height * Config.SKY_CUTOFF)
+        # Lane boundaries
+        self.lane_left = int(width * Config.OUR_LANE_LEFT)
+        self.lane_right = int(width * Config.OUR_LANE_RIGHT)
+        self.sky_y = int(height * Config.SKY_CUTOFF)
+        self.road_y = int(height * 0.40)
         
         self.labels = {
-            0: "PERSON", 1: "BICYCLE", 2: "CAR", 3: "BIKE",
-            5: "BUS", 7: "TRUCK", 16: "DOG", 17: "HORSE",
-            18: "SHEEP", 19: "COW"
+            0: "PERSON", 1: "CYCLIST", 2: "CAR", 3: "BIKE",
+            5: "BUS", 7: "TRUCK", 16: "DOG", 17: "HORSE", 18: "SHEEP", 19: "COW"
         }
         
-        self.real_widths = {
-            0: 0.5, 1: 0.65, 2: 1.8, 3: 0.8, 5: 2.5, 7: 2.4,
-            16: 0.35, 17: 0.6, 18: 0.45, 19: 0.85
+        self.widths = {
+            0: 0.5, 1: 0.65, 2: 1.8, 3: 0.75, 5: 2.5, 7: 2.4,
+            16: 0.35, 17: 0.55, 18: 0.4, 19: 0.8
         }
     
-    def _get_zone(self, cx: int) -> str:
-        """Determine zone based on x position."""
-        if cx < self.left_boundary:
-            return "LEFT"
-        elif cx > self.right_boundary:
-            return "RIGHT"
-        return "CENTER"
-    
-    def _estimate_distance(self, width_px: int, class_id: int) -> float:
-        """Estimate distance using pinhole camera model."""
-        real_width = self.real_widths.get(class_id, 1.5)
-        if width_px > 0:
-            return max(1.0, min(100.0, (real_width * 750) / width_px))
+    def _estimate_distance(self, w_px: int, cls: int) -> float:
+        real = self.widths.get(cls, 1.5)
+        if w_px > 10:
+            return max(2.0, min(99.0, (real * 720) / w_px))
         return 99.0
     
-    def _compute_threat(self, zone: str, area_ratio: float, class_id: int) -> ThreatLevel:
-        """Compute threat level based on zone and size."""
-        if zone == "CENTER":
-            if area_ratio > Config.CRITICAL_AREA:
+    def _compute_threat(self, area: float, dist: float, in_lane: bool, cls: int) -> ThreatLevel:
+        # Pedestrians/animals are always higher threat
+        is_vulnerable = cls in Config.PERSON_CLASSES + Config.ANIMAL_CLASSES
+        
+        if in_lane:
+            if area > Config.CRITICAL_AREA or dist < Config.CRITICAL_DISTANCE:
                 return ThreatLevel.CRITICAL
-            elif area_ratio > Config.HIGH_AREA:
-                return ThreatLevel.HIGH
-            elif area_ratio > Config.MEDIUM_AREA:
+            elif area > Config.HIGH_AREA or dist < Config.CLOSE_DISTANCE:
+                return ThreatLevel.HIGH if is_vulnerable else ThreatLevel.HIGH
+            elif area > Config.MEDIUM_AREA or dist < Config.MEDIUM_DISTANCE:
                 return ThreatLevel.MEDIUM
-            elif area_ratio > 0.008:
+            elif dist < Config.FAR_DISTANCE:
                 return ThreatLevel.LOW
         else:
-            if area_ratio > Config.CRITICAL_AREA:
-                return ThreatLevel.HIGH
-            elif area_ratio > Config.HIGH_AREA:
+            # Side traffic - lower threat
+            if area > Config.CRITICAL_AREA:
                 return ThreatLevel.MEDIUM
-            elif area_ratio > Config.MEDIUM_AREA:
+            elif area > Config.HIGH_AREA:
                 return ThreatLevel.LOW
+        
         return ThreatLevel.NONE
     
     def detect(self, frame: np.ndarray) -> List[Detection]:
-        """Run detection on frame."""
         results = self.model(
-            frame, verbose=False, conf=Config.CONFIDENCE_THRESHOLD,
+            frame, verbose=False, conf=Config.CONFIDENCE,
             classes=Config.ALL_CLASSES, device=self.device, retina_masks=True
         )
         
         detections = []
         
-        for result in results:
-            if result.boxes is None:
+        for r in results:
+            if r.boxes is None:
                 continue
             
-            masks = result.masks.data.cpu().numpy() if result.masks is not None else None
+            masks = r.masks.data.cpu().numpy() if r.masks is not None else None
             
-            for i, box in enumerate(result.boxes):
+            for i, box in enumerate(r.boxes):
                 conf = float(box.conf[0])
                 cls = int(box.cls[0])
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
                 
                 cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
                 w_box, h_box = x2 - x1, y2 - y1
-                area_ratio = (w_box * h_box) / self.frame_area
+                area = (w_box * h_box) / self.area
                 
-                # Filter sky detections
-                if cy < self.sky_line and y2 < self.sky_line:
+                # Filter
+                if cy < self.sky_y:
+                    continue
+                if area < Config.MIN_AREA or area > Config.MAX_AREA:
                     continue
                 
-                # Filter by size
-                if area_ratio < Config.MIN_AREA or area_ratio > Config.MAX_AREA:
-                    continue
-                
-                # Get mask
+                # Mask
                 mask = None
                 if masks is not None and i < len(masks):
                     mask = cv2.resize(masks[i], (self.w, self.h))
                     mask = (mask > 0.5).astype(np.uint8)
                 
-                zone = self._get_zone(cx)
-                distance = self._estimate_distance(w_box, cls)
-                threat = self._compute_threat(zone, area_ratio, cls)
+                # In our lane?
+                in_lane = self.lane_left < cx < self.lane_right and cy > self.road_y
                 
-                # Boost threat for pedestrians/animals in center
-                if cls in Config.PERSON_CLASSES + Config.ANIMAL_CLASSES:
-                    if zone == "CENTER" and cy > self.h * 0.4:
-                        threat = ThreatLevel(min(threat.value + 1, 4))
+                dist = self._estimate_distance(w_box, cls)
+                threat = self._compute_threat(area, dist, in_lane, cls)
                 
                 detections.append(Detection(
                     bbox=(x1, y1, x2, y2),
@@ -340,51 +356,49 @@ class DetectionEngine:
                     label=self.labels.get(cls, "OBJECT"),
                     confidence=conf,
                     center=(cx, cy),
-                    area_ratio=area_ratio,
-                    zone=zone,
-                    distance=round(distance, 1),
-                    threat=threat
+                    area_ratio=area,
+                    distance=round(dist, 1),
+                    threat=threat,
+                    in_our_lane=in_lane
                 ))
         
         return self.tracker.update(detections)
+    
+    def is_approaching(self, det: Detection) -> bool:
+        return self.tracker.is_approaching(det.track_id)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#                              LANE DETECTOR
+#                              LANE DETECTOR  
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class LaneDetector:
-    """Simple lane detection using Hough transform."""
-    
     def __init__(self, width: int, height: int):
         self.w = width
         self.h = height
-        self.history_left = deque(maxlen=10)
-        self.history_right = deque(maxlen=10)
-        self.left_confidence = deque(maxlen=15)
-        self.right_confidence = deque(maxlen=15)
+        self.left_hist = deque(maxlen=12)
+        self.right_hist = deque(maxlen=12)
+        self.left_conf = deque(maxlen=20)
+        self.right_conf = deque(maxlen=20)
     
     def detect(self, frame: np.ndarray) -> LaneInfo:
-        """Detect lane lines in frame."""
         info = LaneInfo()
         h, w = frame.shape[:2]
-        roi_y = int(h * 0.55)
+        
+        roi_y = int(h * 0.52)
         roi = frame[roi_y:h, :]
         
-        # Preprocessing
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
         edges = cv2.Canny(blur, 50, 150)
         
-        # ROI mask
         mask = np.zeros_like(edges)
-        poly = np.array([[(0, edges.shape[0]), (int(w * 0.15), 0),
-                         (int(w * 0.85), 0), (w, edges.shape[0])]], np.int32)
+        poly = np.array([[(int(w*0.05), edges.shape[0]), (int(w*0.40), 0),
+                         (int(w*0.60), 0), (int(w*0.95), edges.shape[0])]], np.int32)
         cv2.fillPoly(mask, poly, 255)
         edges = cv2.bitwise_and(edges, mask)
         
-        # Hough lines
-        lines = cv2.HoughLinesP(edges, 1, np.pi/180, 50, minLineLength=50, maxLineGap=80)
+        lines = cv2.HoughLinesP(edges, 1, np.pi/180, 35, minLineLength=35, maxLineGap=100)
         
         left_lines, right_lines = [], []
         
@@ -394,154 +408,188 @@ class LaneDetector:
                 if x2 == x1:
                     continue
                 slope = (y2 - y1) / (x2 - x1)
-                if abs(slope) < 0.3 or abs(slope) > 3:
+                if abs(slope) < 0.25 or abs(slope) > 4:
                     continue
                 
                 y1 += roi_y
                 y2 += roi_y
                 
-                if slope < 0:
+                if slope < 0 and x1 < w * 0.55:
                     left_lines.append([x1, y1, x2, y2])
-                else:
+                elif slope > 0 and x1 > w * 0.45:
                     right_lines.append([x1, y1, x2, y2])
         
-        # Track lane confidence
-        self.left_confidence.append(1 if len(left_lines) >= 2 else 0)
-        self.right_confidence.append(1 if len(right_lines) >= 2 else 0)
+        self.left_conf.append(1 if len(left_lines) >= 2 else 0)
+        self.right_conf.append(1 if len(right_lines) >= 2 else 0)
         
-        info.left_lane_found = sum(self.left_confidence) / max(1, len(self.left_confidence)) > 0.5
-        info.right_lane_found = sum(self.right_confidence) / max(1, len(self.right_confidence)) > 0.5
+        info.left_detected = sum(self.left_conf) / max(1, len(self.left_conf)) > 0.4
+        info.right_detected = sum(self.right_conf) / max(1, len(self.right_conf)) > 0.4
         
-        # Average and smooth left lane
         if left_lines:
-            avg = np.mean(left_lines, axis=0).astype(int)
-            self.history_left.append(avg)
-        
-        if self.history_left:
-            avg = np.mean(list(self.history_left), axis=0).astype(int)
+            self.left_hist.append(np.mean(left_lines, axis=0).astype(int))
+        if self.left_hist:
+            avg = np.mean(list(self.left_hist), axis=0).astype(int)
             info.left_line = [(avg[0], avg[1]), (avg[2], avg[3])]
         
-        # Average and smooth right lane
         if right_lines:
-            avg = np.mean(right_lines, axis=0).astype(int)
-            self.history_right.append(avg)
-        
-        if self.history_right:
-            avg = np.mean(list(self.history_right), axis=0).astype(int)
+            self.right_hist.append(np.mean(right_lines, axis=0).astype(int))
+        if self.right_hist:
+            avg = np.mean(list(self.right_hist), axis=0).astype(int)
             info.right_line = [(avg[0], avg[1]), (avg[2], avg[3])]
         
-        info.valid = info.left_line is not None or info.right_line is not None
-        
-        # Calculate center offset
         if info.left_line and info.right_line:
             lx = (info.left_line[0][0] + info.left_line[1][0]) / 2
             rx = (info.right_line[0][0] + info.right_line[1][0]) / 2
-            info.center_offset = (w / 2 - (lx + rx) / 2) / (w / 2)
+            info.center_offset = (w/2 - (lx + rx)/2) / (w/2)
         
         return info
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#                              DRIVING ADVISOR
+#                          INTELLIGENT DRIVING ADVISOR
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class DrivingAdvisor:
-    """Context-aware driving advice generator."""
+class IntelligentAdvisor:
+    """
+    Smart driving advisor that understands context:
+    - Identifies lead vehicle (car you're following)
+    - Gives natural advice: FOLLOW, CRUISING, SLOW DOWN, etc.
+    - Side traffic is secondary information
+    """
     
-    def __init__(self, frame_width: int):
-        self.w = frame_width
+    def __init__(self, width: int, height: int, detector: DetectionEngine):
+        self.w = width
+        self.h = height
+        self.detector = detector
+        
+        self.lane_left = int(width * Config.OUR_LANE_LEFT)
+        self.lane_right = int(width * Config.OUR_LANE_RIGHT)
     
-    def _find_primary_obstacle(self, detections: List[Detection]) -> Optional[Detection]:
-        """Find the most important obstacle."""
-        confirmed = [d for d in detections if d.is_confirmed]
-        if not confirmed:
-            return None
-        
-        confirmed.sort(key=lambda d: (-d.threat.value, -d.area_ratio, d.distance))
-        return confirmed[0]
-    
-    def _is_side_clear(self, side: str, detections: List[Detection]) -> bool:
-        """Check if a side is clear."""
-        confirmed = [d for d in detections if d.is_confirmed]
-        side_objects = [d for d in confirmed if d.zone == side]
-        return len(side_objects) == 0
-    
-    def _can_suggest_pass(self, obstacle: Detection, target_side: str,
-                         detections: List[Detection], lanes: LaneInfo) -> Tuple[bool, str]:
-        """Determine if passing is safe."""
-        
-        if not Config.ENABLE_PASS_SUGGESTIONS:
-            return False, "disabled"
-        
-        # Never pass toward the obstacle
-        if obstacle.zone == target_side:
-            return False, "obstacle_on_side"
-        
-        # Check distance
-        if obstacle.distance < Config.MIN_PASS_DISTANCE:
-            return False, "too_close"
-        
-        # Check if side is clear
-        if not self._is_side_clear(target_side, detections):
-            return False, "side_occupied"
-        
-        # Check lane detection requirement
-        if Config.REQUIRE_LANE_DETECTION:
-            if target_side == "LEFT" and not lanes.left_lane_found:
-                return False, "no_left_lane"
-            if target_side == "RIGHT" and not lanes.right_lane_found:
-                return False, "no_right_lane"
-        
-        return True, "clear"
-    
-    def analyze(self, detections: List[Detection], lanes: LaneInfo):
-        """Generate driving advice."""
+    def _analyze_scene(self, detections: List[Detection]) -> DrivingState:
+        """Analyze the driving scene and categorize objects."""
+        state = DrivingState()
         
         confirmed = [d for d in detections if d.is_confirmed]
         
         if not confirmed:
-            return "CLEAR", "Road ahead is clear", Colors.CYAN, ThreatLevel.NONE
+            return state
         
-        obstacle = self._find_primary_obstacle(confirmed)
-        if not obstacle:
-            return "CLEAR", "Road ahead is clear", Colors.CYAN, ThreatLevel.NONE
+        state.road_clear = False
+        state.max_threat = max((d.threat for d in confirmed), default=ThreatLevel.NONE, key=lambda x: x.value)
         
-        max_threat = max((d.threat for d in confirmed), default=ThreatLevel.NONE,
-                        key=lambda x: x.value)
+        # Categorize detections
+        lane_vehicles = []
         
-        # Critical threat
-        if obstacle.threat == ThreatLevel.CRITICAL:
-            if obstacle.class_id in Config.PERSON_CLASSES + Config.ANIMAL_CLASSES:
-                return "STOP", f"{obstacle.label} ON ROAD!", Colors.RED, max_threat
-            return "BRAKE", f"Obstacle {obstacle.distance:.0f}m!", Colors.RED, max_threat
-        
-        # High threat
-        if obstacle.threat == ThreatLevel.HIGH:
-            return "SLOW DOWN", f"{obstacle.label} ahead - {obstacle.distance:.0f}m", Colors.ORANGE, max_threat
-        
-        # Side traffic
-        if obstacle.zone == "LEFT":
-            return "TRAFFIC LEFT", f"{obstacle.label} on left - {obstacle.distance:.0f}m", Colors.YELLOW, max_threat
-        
-        if obstacle.zone == "RIGHT":
-            return "TRAFFIC RIGHT", f"{obstacle.label} on right - {obstacle.distance:.0f}m", Colors.YELLOW, max_threat
-        
-        # Center obstacle - check passing
-        if obstacle.zone == "CENTER":
-            can_left, _ = self._can_suggest_pass(obstacle, "LEFT", confirmed, lanes)
-            can_right, _ = self._can_suggest_pass(obstacle, "RIGHT", confirmed, lanes)
+        for d in confirmed:
+            cx = d.center[0]
             
-            if can_left:
-                return "PASS LEFT", f"{obstacle.label} ahead - left clear", Colors.GREEN, max_threat
-            elif can_right:
-                return "PASS RIGHT", f"{obstacle.label} ahead - right clear", Colors.GREEN, max_threat
-            else:
-                if obstacle.distance < Config.MIN_PASS_DISTANCE:
-                    return "MAINTAIN GAP", f"Following {obstacle.label} - {obstacle.distance:.0f}m", Colors.YELLOW, max_threat
-                else:
-                    return "FOLLOW", f"Behind {obstacle.label} - no clear lane", Colors.YELLOW, max_threat
+            # Pedestrians/animals - special category
+            if d.class_id in Config.PERSON_CLASSES + Config.ANIMAL_CLASSES:
+                if d.in_our_lane:
+                    state.pedestrians.append(d)
+                continue
+            
+            # Vehicles
+            if d.in_our_lane:
+                lane_vehicles.append(d)
+            elif cx < self.lane_left:
+                state.left_traffic.append(d)
+            elif cx > self.lane_right:
+                state.right_traffic.append(d)
         
-        return "CAUTION", f"{obstacle.label} detected", Colors.YELLOW, max_threat
+        # Find lead vehicle - the most important vehicle ahead
+        if lane_vehicles:
+            # Sort by: threat (highest first), then by vertical position (lower = closer)
+            lane_vehicles.sort(key=lambda d: (-d.threat.value, -d.center[1]))
+            state.lead_vehicle = lane_vehicles[0]
+            state.lead_vehicle.is_lead = True
+        
+        # If no vehicle in lane but pedestrian exists, that's our "lead"
+        if not state.lead_vehicle and state.pedestrians:
+            state.pedestrians.sort(key=lambda d: (-d.threat.value, -d.center[1]))
+            state.lead_vehicle = state.pedestrians[0]
+            state.lead_vehicle.is_lead = True
+        
+        return state
+    
+    def _can_pass(self, side: str, state: DrivingState, lanes: LaneInfo) -> bool:
+        """Check if safe to pass on given side."""
+        if not state.lead_vehicle:
+            return False
+        
+        if state.lead_vehicle.distance < Config.MIN_PASS_DISTANCE:
+            return False
+        
+        if side == "LEFT":
+            return len(state.left_traffic) == 0 and lanes.left_detected
+        else:
+            return len(state.right_traffic) == 0 and lanes.right_detected
+    
+    def analyze(self, detections: List[Detection], lanes: LaneInfo) -> Tuple[str, str, Tuple, ThreatLevel, DrivingState]:
+        """Generate intelligent driving advice."""
+        
+        state = self._analyze_scene(detections)
+        
+        # Road is completely clear
+        if state.road_clear or (not state.lead_vehicle and not state.left_traffic and not state.right_traffic):
+            return "CLEAR ROAD", "No obstacles detected", Colors.CYAN, ThreatLevel.NONE, state
+        
+        lead = state.lead_vehicle
+        
+        # No lead vehicle but side traffic exists
+        if not lead:
+            left_n = len(state.left_traffic)
+            right_n = len(state.right_traffic)
+            
+            if left_n and right_n:
+                return "CAUTION", f"Traffic on both sides", Colors.YELLOW, state.max_threat, state
+            elif left_n:
+                return "STAY RIGHT", f"{left_n} vehicle(s) on left", Colors.CYAN, state.max_threat, state
+            elif right_n:
+                return "STAY LEFT", f"{right_n} vehicle(s) on right", Colors.CYAN, state.max_threat, state
+            
+            return "CLEAR ROAD", "Lane is clear", Colors.CYAN, ThreatLevel.NONE, state
+        
+        # We have a lead vehicle - provide intelligent advice
+        is_pedestrian = lead.class_id in Config.PERSON_CLASSES + Config.ANIMAL_CLASSES
+        approaching = self.detector.is_approaching(lead)
+        
+        # ═══ CRITICAL - EMERGENCY ═══
+        if lead.threat == ThreatLevel.CRITICAL:
+            if is_pedestrian:
+                return "STOP!", f"{lead.label} on road!", Colors.RED, ThreatLevel.CRITICAL, state
+            if approaching:
+                return "BRAKE!", f"Collision risk - {lead.distance:.0f}m", Colors.RED, ThreatLevel.CRITICAL, state
+            return "BRAKE!", f"Too close - {lead.distance:.0f}m", Colors.RED, ThreatLevel.CRITICAL, state
+        
+        # ═══ HIGH - SLOW DOWN ═══
+        if lead.threat == ThreatLevel.HIGH:
+            if approaching:
+                return "SLOW DOWN", f"Approaching {lead.label} - {lead.distance:.0f}m", Colors.ORANGE, ThreatLevel.HIGH, state
+            return "CAUTION", f"{lead.label} close - {lead.distance:.0f}m", Colors.ORANGE, ThreatLevel.HIGH, state
+        
+        # ═══ MEDIUM - FOLLOWING ═══
+        if lead.threat == ThreatLevel.MEDIUM:
+            # Check passing options
+            can_left = self._can_pass("LEFT", state, lanes)
+            can_right = self._can_pass("RIGHT", state, lanes)
+            
+            if can_left and lead.distance > Config.MIN_PASS_DISTANCE:
+                return "PASS LEFT", f"Clear to overtake {lead.label}", Colors.GREEN, ThreatLevel.MEDIUM, state
+            elif can_right and lead.distance > Config.MIN_PASS_DISTANCE:
+                return "PASS RIGHT", f"Clear to overtake {lead.label}", Colors.GREEN, ThreatLevel.MEDIUM, state
+            
+            if approaching:
+                return "EASE OFF", f"Closing on {lead.label} - {lead.distance:.0f}m", Colors.YELLOW, ThreatLevel.MEDIUM, state
+            
+            return "FOLLOW", f"Behind {lead.label} - {lead.distance:.0f}m", Colors.YELLOW, ThreatLevel.MEDIUM, state
+        
+        # ═══ LOW - CRUISING ═══
+        if lead.threat == ThreatLevel.LOW:
+            return "CRUISING", f"{lead.label} ahead - {lead.distance:.0f}m", Colors.CYAN, ThreatLevel.LOW, state
+        
+        # ═══ CLEAR ═══
+        return "CLEAR ROAD", "Lane is clear", Colors.CYAN, ThreatLevel.NONE, state
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -549,133 +597,139 @@ class DrivingAdvisor:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class HUDRenderer:
-    """Clean HUD renderer with segmentation overlays."""
-    
     def __init__(self, width: int, height: int):
         self.w = width
         self.h = height
-        self.frame_count = 0
+        self.frame_n = 0
+        
         self.main_text = "STARTING"
         self.sub_text = "Initializing..."
         self.main_color = Colors.CYAN
-        self.stable_frames = 0
+        self.stable = 0
         self.last_main = ""
+        
+        self.lane_left = int(width * Config.OUR_LANE_LEFT)
+        self.lane_right = int(width * Config.OUR_LANE_RIGHT)
     
     def _get_color(self, det: Detection) -> Tuple[int, int, int]:
-        """Get color for detection based on type and threat."""
+        if det.is_lead:
+            # Lead vehicle gets special color based on threat
+            if det.threat == ThreatLevel.CRITICAL:
+                return Colors.RED
+            elif det.threat == ThreatLevel.HIGH:
+                return Colors.ORANGE
+            elif det.threat == ThreatLevel.MEDIUM:
+                return Colors.YELLOW
+            return Colors.SEG_LEAD
+        
         if det.class_id in Config.PERSON_CLASSES:
             return Colors.SEG_PERSON
         elif det.class_id in Config.ANIMAL_CLASSES:
             return Colors.SEG_ANIMAL
         
-        threat_colors = {
-            ThreatLevel.CRITICAL: Colors.RED,
-            ThreatLevel.HIGH: Colors.ORANGE,
-            ThreatLevel.MEDIUM: Colors.YELLOW,
-            ThreatLevel.LOW: Colors.GREEN,
-            ThreatLevel.NONE: Colors.SEG_VEHICLE
-        }
-        return threat_colors.get(det.threat, Colors.SEG_VEHICLE)
+        return Colors.SEG_VEHICLE
     
-    def _draw_segmentation(self, frame: np.ndarray, detections: List[Detection]) -> np.ndarray:
-        """Draw segmentation masks."""
+    def _draw_segments(self, frame: np.ndarray, detections: List[Detection]) -> np.ndarray:
         if not detections:
             return frame
         
         overlay = frame.copy()
-        edge_layer = np.zeros_like(frame)
+        edges = np.zeros_like(frame)
         
         for det in detections:
             color = self._get_color(det)
             
             if det.mask is not None:
-                mask_bool = det.mask > 0
-                overlay[mask_bool] = color
+                m = det.mask > 0
+                overlay[m] = color
                 
                 contours, _ = cv2.findContours(det.mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 if contours:
-                    cv2.drawContours(edge_layer, contours, -1, color, 4)
-                    cv2.drawContours(edge_layer, contours, -1, Colors.WHITE, 1)
+                    thickness = 5 if det.is_lead else 3
+                    cv2.drawContours(edges, contours, -1, color, thickness)
+                    cv2.drawContours(edges, contours, -1, Colors.WHITE, 1)
         
         result = cv2.addWeighted(overlay, Config.MASK_ALPHA, frame, 1 - Config.MASK_ALPHA, 0)
-        result = cv2.addWeighted(edge_layer, 0.5, result, 1, 0)
+        result = cv2.addWeighted(edges, 0.5, result, 1, 0)
         return result
     
-    def _draw_labels(self, frame: np.ndarray, detections: List[Detection]):
-        """Draw floating labels for detections."""
+    def _draw_labels(self, frame: np.ndarray, detections: List[Detection], state: DrivingState):
         for det in detections:
-            if det.area_ratio < 0.005 and det.threat == ThreatLevel.NONE:
+            if det.area_ratio < 0.004 and det.threat == ThreatLevel.NONE:
                 continue
             
             x1, y1, x2, y2 = det.bbox
             cx, cy = det.center
             color = self._get_color(det)
             
-            label = det.label
-            dist_text = f"{det.distance:.0f}m"
+            # Label
+            prefix = ">> " if det.is_lead else ""
+            label = f"{prefix}{det.label}"
+            dist = f"{det.distance:.0f}m"
             
             font = cv2.FONT_HERSHEY_SIMPLEX
-            scale = 0.48
+            scale = 0.52 if det.is_lead else 0.46
+            thick = 1
             
-            lbl_sz = cv2.getTextSize(label, font, scale, 1)[0]
-            dist_sz = cv2.getTextSize(dist_text, font, scale, 1)[0]
-            total_w = lbl_sz[0] + dist_sz[0] + 10
+            lsz = cv2.getTextSize(label, font, scale, thick)[0]
+            dsz = cv2.getTextSize(dist, font, scale, thick)[0]
+            total = lsz[0] + dsz[0] + 12
             
-            tx = cx - total_w // 2
-            ty = y1 - 10 if y1 > 60 else y2 + 20
+            tx = cx - total // 2
+            ty = y1 - 12 if y1 > 65 else y2 + 22
             
             # Background
-            cv2.rectangle(frame, (tx - 4, ty - lbl_sz[1] - 4),
-                         (tx + total_w + 4, ty + 6), Colors.NEAR_BLACK, -1)
-            cv2.rectangle(frame, (tx - 4, ty - lbl_sz[1] - 4),
-                         (tx + total_w + 4, ty + 6), color, 1)
+            pad = 5
+            cv2.rectangle(frame, (tx - pad, ty - lsz[1] - pad), 
+                         (tx + total + pad, ty + pad + 2), Colors.NEAR_BLACK, -1)
+            
+            # Border - thicker for lead
+            border_thick = 2 if det.is_lead else 1
+            cv2.rectangle(frame, (tx - pad, ty - lsz[1] - pad),
+                         (tx + total + pad, ty + pad + 2), color, border_thick)
             
             # Text
-            cv2.putText(frame, label, (tx, ty), font, scale, color, 1, cv2.LINE_AA)
-            cv2.putText(frame, dist_text, (tx + lbl_sz[0] + 8, ty),
-                       font, scale, Colors.LIGHT_GRAY, 1, cv2.LINE_AA)
+            cv2.putText(frame, label, (tx, ty), font, scale, color, thick, cv2.LINE_AA)
+            cv2.putText(frame, dist, (tx + lsz[0] + 10, ty), font, scale, Colors.LIGHT_GRAY, thick, cv2.LINE_AA)
             
             # Connection line
-            line_y = ty + 6 if ty > cy else ty - lbl_sz[1] - 4
-            cv2.line(frame, (cx, line_y), (cx, cy), color, 1)
-            cv2.circle(frame, (cx, cy), 3, color, -1)
+            ly = ty + pad + 2 if ty < cy else ty - lsz[1] - pad
+            cv2.line(frame, (cx, ly), (cx, cy), color, 1)
+            cv2.circle(frame, (cx, cy), 4 if det.is_lead else 3, color, -1)
     
-    def _draw_road_overlay(self, frame: np.ndarray) -> np.ndarray:
-        """Draw road perspective overlay."""
+    def _draw_road(self, frame: np.ndarray) -> np.ndarray:
         h, w = self.h, self.w
         overlay = frame.copy()
         
-        road_h = int(h * 0.22)
-        road_top = h - road_h
-        vp_x, vp_y = w // 2, road_top
+        rh = int(h * 0.23)
+        rt = h - rh
+        vx, vy = w // 2, rt
+        lb, rb = int(w * 0.06), int(w * 0.94)
         
-        pts = np.array([[vp_x, vp_y], [int(w * 0.92), h], [int(w * 0.08), h]], np.int32)
-        road_layer = frame.copy()
-        cv2.fillPoly(road_layer, [pts], Colors.ROAD_SURFACE)
-        overlay = cv2.addWeighted(road_layer, 0.2, overlay, 0.8, 0)
+        # Road surface
+        pts = np.array([[vx, vy], [rb, h], [lb, h]], np.int32)
+        road = frame.copy()
+        cv2.fillPoly(road, [pts], Colors.ROAD)
+        overlay = cv2.addWeighted(road, 0.22, overlay, 0.78, 0)
         
-        cv2.line(overlay, (vp_x, vp_y), (int(w * 0.08), h), Colors.ROAD_EDGE, 2)
-        cv2.line(overlay, (vp_x, vp_y), (int(w * 0.92), h), Colors.ROAD_EDGE, 2)
+        # Edges
+        cv2.line(overlay, (vx, vy), (lb, h), Colors.ROAD_EDGE, 2)
+        cv2.line(overlay, (vx, vy), (rb, h), Colors.ROAD_EDGE, 2)
         
         # Center dashes
-        for i in range(5):
-            t1, t2 = i / 5, (i + 0.3) / 5
-            y1 = int(vp_y + (h - vp_y) * t1)
-            y2 = int(vp_y + (h - vp_y) * t2)
-            thick = max(1, int(1 + t1 * 2))
-            alpha = 0.15 + t1 * 0.4
+        for i in range(6):
+            t1, t2 = i / 6, (i + 0.35) / 6
+            y1 = int(vy + (h - vy) * t1)
+            y2 = int(vy + (h - vy) * t2)
+            th = max(1, int(1 + t1 * 2.5))
             
             tmp = overlay.copy()
-            cv2.line(tmp, (vp_x, y1), (vp_x, y2), Colors.LIGHT_GRAY, thick)
-            overlay = cv2.addWeighted(tmp, alpha, overlay, 1 - alpha, 0)
+            cv2.line(tmp, (vx, y1), (vx, y2), Colors.LANE_LINE, th)
+            overlay = cv2.addWeighted(tmp, 0.15 + t1 * 0.45, overlay, 0.85 - t1 * 0.45, 0)
         
         return overlay
     
     def _draw_lanes(self, frame: np.ndarray, lanes: LaneInfo) -> np.ndarray:
-        """Draw detected lane lines."""
-        if not lanes.valid:
-            return frame
-        
         overlay = frame.copy()
         
         if lanes.left_line:
@@ -685,115 +739,109 @@ class HUDRenderer:
         
         return cv2.addWeighted(overlay, 0.35, frame, 0.65, 0)
     
-    def _draw_top_bar(self, frame: np.ndarray, fps: float, obj_count: int, lanes: LaneInfo):
-        """Draw top status bar."""
-        bar_h = 40
+    def _draw_top_bar(self, frame: np.ndarray, fps: float, state: DrivingState, lanes: LaneInfo):
+        h = 42
         
-        # Background gradient
-        for y in range(bar_h):
-            alpha = 1 - (y / bar_h) ** 2
-            cv2.line(frame, (0, y), (self.w, y),
-                    tuple(int(c * alpha) for c in Colors.NEAR_BLACK), 1)
+        for y in range(h):
+            a = 1 - (y / h) ** 2
+            cv2.line(frame, (0, y), (self.w, y), tuple(int(c * a) for c in Colors.NEAR_BLACK), 1)
         
-        cv2.line(frame, (0, bar_h), (self.w, bar_h), Colors.CYAN, 1)
+        cv2.line(frame, (0, h), (self.w, h), Colors.CYAN, 1)
         
         # Time
-        cv2.putText(frame, datetime.now().strftime("%H:%M"), (15, 28),
+        cv2.putText(frame, datetime.now().strftime("%H:%M"), (15, 29),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, Colors.WHITE, 1, cv2.LINE_AA)
         
         # Title
         title = "AI DRIVING ASSISTANT"
         tsz = cv2.getTextSize(title, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
-        cv2.putText(frame, title, ((self.w - tsz[0]) // 2, 27),
+        cv2.putText(frame, title, ((self.w - tsz[0]) // 2, 28),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, Colors.CYAN, 1, cv2.LINE_AA)
         
-        # Lane status
-        left_ind = "L" if lanes.left_lane_found else "-"
-        right_ind = "R" if lanes.right_lane_found else "-"
-        cv2.putText(frame, f"LANE:{left_ind}|{right_ind}", (self.w - 200, 27),
+        # Lane indicators
+        li = "L" if lanes.left_detected else "-"
+        ri = "R" if lanes.right_detected else "-"
+        cv2.putText(frame, f"LANES:{li}|{ri}", (self.w - 210, 28),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, Colors.GRAY, 1, cv2.LINE_AA)
         
-        # Object count
-        obj_color = Colors.WHITE if obj_count > 0 else Colors.GRAY
-        cv2.putText(frame, f"OBJ:{obj_count}", (self.w - 120, 27),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.45, obj_color, 1, cv2.LINE_AA)
+        # Traffic counts
+        ln = len(state.left_traffic)
+        rn = len(state.right_traffic)
+        if ln or rn:
+            cv2.putText(frame, f"L:{ln} R:{rn}", (self.w - 130, 28),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, Colors.YELLOW, 1, cv2.LINE_AA)
         
         # FPS
-        fps_color = Colors.GREEN if fps > 20 else Colors.YELLOW if fps > 12 else Colors.RED
-        cv2.putText(frame, f"{int(fps)}FPS", (self.w - 55, 27),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.45, fps_color, 1, cv2.LINE_AA)
+        fc = Colors.GREEN if fps > 22 else Colors.YELLOW if fps > 14 else Colors.RED
+        cv2.putText(frame, f"{int(fps)}fps", (self.w - 50, 28),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, fc, 1, cv2.LINE_AA)
     
-    def _draw_bottom_panel(self, frame: np.ndarray):
-        """Draw bottom instruction panel."""
-        panel_h = 75
-        panel_y = self.h - panel_h
+    def _draw_bottom(self, frame: np.ndarray, state: DrivingState):
+        ph = 78
+        py = self.h - ph
         
-        # Background gradient
-        for y in range(panel_h):
-            alpha = (y / panel_h) ** 1.5
-            cv2.line(frame, (0, panel_y + y), (self.w, panel_y + y),
-                    tuple(int(c * alpha) for c in Colors.NEAR_BLACK), 1)
+        for y in range(ph):
+            a = (y / ph) ** 1.6
+            cv2.line(frame, (0, py + y), (self.w, py + y),
+                    tuple(int(c * a) for c in Colors.NEAR_BLACK), 1)
         
-        # Top line
-        cv2.line(frame, (0, panel_y), (self.w, panel_y), Colors.DARK_GRAY, 1)
-        cv2.line(frame, (0, panel_y), (60, panel_y), self.main_color, 2)
-        cv2.line(frame, (self.w - 60, panel_y), (self.w, panel_y), self.main_color, 2)
+        cv2.line(frame, (0, py), (self.w, py), Colors.DARK_GRAY, 1)
+        cv2.line(frame, (0, py), (70, py), self.main_color, 2)
+        cv2.line(frame, (self.w - 70, py), (self.w, py), self.main_color, 2)
         
         # Main text
         font = cv2.FONT_HERSHEY_DUPLEX
-        msz = cv2.getTextSize(self.main_text, font, 1.1, 2)[0]
+        msz = cv2.getTextSize(self.main_text, font, 1.15, 2)[0]
         mx = (self.w - msz[0]) // 2
-        my = panel_y + 38
+        my = py + 40
         
-        cv2.putText(frame, self.main_text, (mx + 2, my + 2), font, 1.1, Colors.BLACK, 2, cv2.LINE_AA)
-        cv2.putText(frame, self.main_text, (mx, my), font, 1.1, self.main_color, 2, cv2.LINE_AA)
+        cv2.putText(frame, self.main_text, (mx + 2, my + 2), font, 1.15, Colors.BLACK, 2, cv2.LINE_AA)
+        cv2.putText(frame, self.main_text, (mx, my), font, 1.15, self.main_color, 2, cv2.LINE_AA)
         
         # Sub text
-        ssz = cv2.getTextSize(self.sub_text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)[0]
-        cv2.putText(frame, self.sub_text, ((self.w - ssz[0]) // 2, panel_y + 58),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.45, Colors.LIGHT_GRAY, 1, cv2.LINE_AA)
+        ssz = cv2.getTextSize(self.sub_text, cv2.FONT_HERSHEY_SIMPLEX, 0.46, 1)[0]
+        cv2.putText(frame, self.sub_text, ((self.w - ssz[0]) // 2, py + 62),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.46, Colors.LIGHT_GRAY, 1, cv2.LINE_AA)
     
-    def _draw_side_indicators(self, frame: np.ndarray, detections: List[Detection]):
-        """Draw side traffic indicators."""
-        left_n = sum(1 for d in detections if d.zone == "LEFT" and d.is_confirmed)
-        right_n = sum(1 for d in detections if d.zone == "RIGHT" and d.is_confirmed)
+    def _draw_side_arrows(self, frame: np.ndarray, state: DrivingState):
+        my = self.h // 2
         
-        mid_y = self.h // 2
-        
-        if left_n > 0:
-            pts = np.array([[12, mid_y], [28, mid_y - 14], [28, mid_y + 14]], np.int32)
+        if state.left_traffic:
+            n = len(state.left_traffic)
+            pts = np.array([[14, my], [32, my - 16], [32, my + 16]], np.int32)
             cv2.fillPoly(frame, [pts], Colors.YELLOW)
-            cv2.putText(frame, str(left_n), (32, mid_y + 5),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, Colors.YELLOW, 1, cv2.LINE_AA)
+            cv2.putText(frame, str(n), (36, my + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.42, Colors.YELLOW, 1, cv2.LINE_AA)
         
-        if right_n > 0:
-            pts = np.array([[self.w - 12, mid_y], [self.w - 28, mid_y - 14],
-                           [self.w - 28, mid_y + 14]], np.int32)
+        if state.right_traffic:
+            n = len(state.right_traffic)
+            pts = np.array([[self.w - 14, my], [self.w - 32, my - 16], [self.w - 32, my + 16]], np.int32)
             cv2.fillPoly(frame, [pts], Colors.YELLOW)
-            cv2.putText(frame, str(right_n), (self.w - 45, mid_y + 5),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, Colors.YELLOW, 1, cv2.LINE_AA)
+            cv2.putText(frame, str(n), (self.w - 50, my + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.42, Colors.YELLOW, 1, cv2.LINE_AA)
     
-    def _draw_minimap(self, frame: np.ndarray, detections: List[Detection]):
-        """Draw radar minimap."""
-        mw, mh = 85, 68
-        mx, my = self.w - mw - 10, 48
+    def _draw_minimap(self, frame: np.ndarray, detections: List[Detection], state: DrivingState):
+        mw, mh = 90, 72
+        mx, my = self.w - mw - 12, 50
         
-        # Background
         overlay = frame.copy()
         cv2.rectangle(overlay, (mx, my), (mx + mw, my + mh), Colors.NEAR_BLACK, -1)
-        frame[:] = cv2.addWeighted(overlay, 0.7, frame, 0.3, 0)
+        frame[:] = cv2.addWeighted(overlay, 0.75, frame, 0.25, 0)
         cv2.rectangle(frame, (mx, my), (mx + mw, my + mh), Colors.DARK_GRAY, 1)
         
-        # Road shape
-        pts = np.array([[mx + mw // 2, my + 5], [mx + mw - 10, my + mh - 5],
-                       [mx + 10, my + mh - 5]], np.int32)
+        # Lane boundaries on map
+        llx = mx + int(mw * Config.OUR_LANE_LEFT)
+        rlx = mx + int(mw * Config.OUR_LANE_RIGHT)
+        cv2.line(frame, (llx, my + 5), (llx, my + mh - 5), Colors.DARK_GRAY, 1)
+        cv2.line(frame, (rlx, my + 5), (rlx, my + mh - 5), Colors.DARK_GRAY, 1)
+        
+        # Road
+        pts = np.array([[mx + mw//2, my + 6], [mx + mw - 12, my + mh - 6], [mx + 12, my + mh - 6]], np.int32)
         cv2.polylines(frame, [pts], True, Colors.ROAD_EDGE, 1)
         
-        # Self indicator
-        cx, cy = mx + mw // 2, my + mh - 10
-        cv2.fillPoly(frame, [np.array([[cx, cy - 5], [cx - 4, cy + 3], [cx + 4, cy + 3]])], Colors.CYAN)
+        # Self
+        sx, sy = mx + mw // 2, my + mh - 12
+        cv2.fillPoly(frame, [np.array([[sx, sy - 6], [sx - 5, sy + 4], [sx + 5, sy + 4]])], Colors.CYAN)
         
-        # Other objects
+        # Others
         for det in detections:
             if not det.is_confirmed:
                 continue
@@ -802,15 +850,15 @@ class HUDRenderer:
             ry = 1 - (det.center[1] / self.h)
             
             dx = int(mx + rx * mw)
-            dy = int(my + mh - 8 - ry * (mh - 18))
+            dy = int(my + mh - 10 - ry * (mh - 20))
+            dx = max(mx + 5, min(mx + mw - 5, dx))
+            dy = max(my + 5, min(my + mh - 5, dy))
             
-            dx = max(mx + 4, min(mx + mw - 4, dx))
-            dy = max(my + 4, min(my + mh - 4, dy))
-            
-            cv2.circle(frame, (dx, dy), 3, self._get_color(det), -1)
+            color = self._get_color(det)
+            size = 5 if det.is_lead else 3
+            cv2.circle(frame, (dx, dy), size, color, -1)
     
-    def _draw_threat_badge(self, frame: np.ndarray, threat: ThreatLevel):
-        """Draw threat level badge."""
+    def _draw_threat(self, frame: np.ndarray, threat: ThreatLevel):
         if threat == ThreatLevel.NONE:
             return
         
@@ -821,73 +869,85 @@ class HUDRenderer:
             ThreatLevel.CRITICAL: ("CRITICAL", Colors.RED)
         }
         
-        text, color = labels.get(threat, ("", Colors.WHITE))
-        x, y = 15, 52
+        txt, col = labels.get(threat, ("", Colors.WHITE))
+        x, y = 15, 54
         
-        # Pulse for critical
-        if threat == ThreatLevel.CRITICAL and int(self.frame_count * 0.15) % 2:
-            cv2.rectangle(frame, (x - 4, y - 14), (x + 72, y + 6), Colors.RED, 2)
+        if threat == ThreatLevel.CRITICAL and int(self.frame_n * 0.12) % 2:
+            cv2.rectangle(frame, (x - 5, y - 16), (x + 78, y + 8), Colors.RED, 2)
         
-        cv2.rectangle(frame, (x, y - 12), (x + 68, y + 4), Colors.NEAR_BLACK, -1)
-        cv2.rectangle(frame, (x, y - 12), (x + 68, y + 4), color, 1)
-        cv2.circle(frame, (x + 10, y - 3), 4, color, -1)
-        cv2.putText(frame, text, (x + 18, y), cv2.FONT_HERSHEY_SIMPLEX, 0.33, color, 1, cv2.LINE_AA)
+        cv2.rectangle(frame, (x, y - 14), (x + 72, y + 5), Colors.NEAR_BLACK, -1)
+        cv2.rectangle(frame, (x, y - 14), (x + 72, y + 5), col, 1)
+        cv2.circle(frame, (x + 11, y - 4), 5, col, -1)
+        cv2.putText(frame, txt, (x + 20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.35, col, 1, cv2.LINE_AA)
     
     def _draw_crosshair(self, frame: np.ndarray):
-        """Draw center crosshair."""
-        cx, cy = self.w // 2, self.h // 2 - 20
-        size, gap = 15, 5
+        cx, cy = self.w // 2, self.h // 2 - 22
+        s, g = 16, 6
         
-        cv2.line(frame, (cx - size, cy), (cx - gap, cy), Colors.CYAN, 1)
-        cv2.line(frame, (cx + gap, cy), (cx + size, cy), Colors.CYAN, 1)
-        cv2.line(frame, (cx, cy - size), (cx, cy - gap), Colors.CYAN, 1)
-        cv2.line(frame, (cx, cy + gap), (cx, cy + size), Colors.CYAN, 1)
+        cv2.line(frame, (cx - s, cy), (cx - g, cy), Colors.CYAN, 1)
+        cv2.line(frame, (cx + g, cy), (cx + s, cy), Colors.CYAN, 1)
+        cv2.line(frame, (cx, cy - s), (cx, cy - g), Colors.CYAN, 1)
+        cv2.line(frame, (cx, cy + g), (cx, cy + s), Colors.CYAN, 1)
         cv2.circle(frame, (cx, cy), 2, Colors.CYAN, -1)
     
+    def _draw_lead_indicator(self, frame: np.ndarray, state: DrivingState):
+        """Draw special indicator for lead vehicle."""
+        if not state.lead_vehicle:
+            return
+        
+        lead = state.lead_vehicle
+        _, y1, _, y2 = lead.bbox
+        cx = lead.center[0]
+        
+        # Distance arc
+        arc_y = y2 + 15
+        if arc_y < self.h - 100:
+            color = self._get_color(lead)
+            cv2.ellipse(frame, (cx, arc_y), (40, 8), 0, 0, 180, color, 2)
+            
+            txt = f"{lead.distance:.0f}m"
+            tsz = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)[0]
+            tx = cx - tsz[0] // 2
+            
+            cv2.rectangle(frame, (tx - 4, arc_y + 2), (tx + tsz[0] + 4, arc_y + 18), Colors.NEAR_BLACK, -1)
+            cv2.putText(frame, txt, (tx, arc_y + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+    
     def update_text(self, main: str, sub: str, color: Tuple, threat: ThreatLevel):
-        """Update display text with smoothing."""
         if threat == ThreatLevel.CRITICAL:
             self.main_text = main
             self.sub_text = sub
             self.main_color = color
-            self.stable_frames = 0
+            self.stable = 0
             self.last_main = main
             return
         
         if main == self.last_main:
-            self.stable_frames += 1
+            self.stable += 1
         else:
-            self.stable_frames = 0
+            self.stable = 0
             self.last_main = main
         
-        if self.stable_frames >= 4:
+        if self.stable >= 3:
             self.main_text = main
             self.sub_text = sub
             self.main_color = color
     
-    def render(self, frame: np.ndarray, detections: List[Detection],
-               lanes: LaneInfo, fps: float) -> np.ndarray:
-        """Render complete HUD."""
-        self.frame_count += 1
+    def render(self, frame: np.ndarray, detections: List[Detection], 
+               lanes: LaneInfo, fps: float, state: DrivingState) -> np.ndarray:
+        self.frame_n += 1
         
-        # Draw layers
         frame = self._draw_lanes(frame, lanes)
-        frame = self._draw_segmentation(frame, detections)
-        frame = self._draw_road_overlay(frame)
-        self._draw_labels(frame, detections)
+        frame = self._draw_segments(frame, detections)
+        frame = self._draw_road(frame)
+        
+        self._draw_lead_indicator(frame, state)
+        self._draw_labels(frame, detections, state)
         self._draw_crosshair(frame)
-        self._draw_side_indicators(frame, detections)
-        self._draw_minimap(frame, detections)
-        
-        # Threat badge
-        confirmed = [d for d in detections if d.is_confirmed]
-        max_threat = max((d.threat for d in confirmed), default=ThreatLevel.NONE,
-                        key=lambda x: x.value)
-        self._draw_threat_badge(frame, max_threat)
-        
-        # UI panels
-        self._draw_top_bar(frame, fps, len(confirmed), lanes)
-        self._draw_bottom_panel(frame)
+        self._draw_side_arrows(frame, state)
+        self._draw_minimap(frame, detections, state)
+        self._draw_threat(frame, state.max_threat)
+        self._draw_top_bar(frame, fps, state, lanes)
+        self._draw_bottom(frame, state)
         
         return frame
 
@@ -897,54 +957,49 @@ class HUDRenderer:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class DrivingAssistant:
-    """Main application class."""
-    
     def __init__(self):
         print("\n" + "=" * 60)
-        print("   AI DRIVING ASSISTANT v8.1 - FINAL")
-        print("   Smart Detection - Context-Aware Logic")
+        print("   INTELLIGENT DRIVING ASSISTANT v9.0")
+        print("   Lead Vehicle Tracking - Context-Aware Advice")
         print("=" * 60 + "\n")
         
-        # Open video source
         source = Config.TEST_VIDEO_PATH if Config.USE_TEST_VIDEO else Config.LIVE_CAMERA_INDEX
         print(f"[1/4] Opening: {source}")
         self.cap = cv2.VideoCapture(source)
         
         if not self.cap.isOpened():
-            raise ValueError(f"Cannot open video source: {source}")
+            raise ValueError(f"Cannot open: {source}")
         
         self.w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 30
-        print(f"      Resolution: {self.w}x{self.h} @ {self.fps:.0f}fps")
+        print(f"      {self.w}x{self.h} @ {self.fps:.0f}fps")
         
-        # Initialize components
         print("\n[2/4] Loading detection engine...")
         self.detector = DetectionEngine(self.w, self.h)
         
         print("\n[3/4] Initializing lane detection...")
-        self.lane_detector = LaneDetector(self.w, self.h)
+        self.lanes = LaneDetector(self.w, self.h)
         
-        print("\n[4/4] Setting up HUD...")
+        print("\n[4/4] Setting up advisor & HUD...")
+        self.advisor = IntelligentAdvisor(self.w, self.h, self.detector)
         self.hud = HUDRenderer(self.w, self.h)
-        self.advisor = DrivingAdvisor(self.w)
         
-        # Output writer
         self.writer = None
         if Config.SAVE_OUTPUT:
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            self.writer = cv2.VideoWriter(Config.OUTPUT_PATH, fourcc, self.fps, (self.w, self.h))
-            print(f"\n      Recording to: {Config.OUTPUT_PATH}")
+            self.writer = cv2.VideoWriter(
+                Config.OUTPUT_PATH, cv2.VideoWriter_fourcc(*'mp4v'),
+                self.fps, (self.w, self.h)
+            )
+            print(f"\n      Recording: {Config.OUTPUT_PATH}")
         
-        self.fps_buffer = deque(maxlen=30)
+        self.fps_buf = deque(maxlen=30)
         
         print("\n" + "=" * 60)
-        print("   Ready! Controls:")
-        print("   [Q] Quit    [R] Restart    [Space] Pause")
+        print("   [Q] Quit  [R] Restart  [Space] Pause  [S] Screenshot")
         print("=" * 60 + "\n")
     
     def run(self):
-        """Main processing loop."""
         paused = False
         
         try:
@@ -959,46 +1014,46 @@ class DrivingAssistant:
                             continue
                         break
                     
-                    # Process frame
+                    # Detect
                     detections = self.detector.detect(frame)
-                    lanes = self.lane_detector.detect(frame)
+                    lane_info = self.lanes.detect(frame)
                     
-                    # Get advice
-                    main, sub, color, threat = self.advisor.analyze(detections, lanes)
+                    # Analyze
+                    main, sub, color, threat, state = self.advisor.analyze(detections, lane_info)
                     self.hud.update_text(main, sub, color, threat)
                     
-                    # Calculate FPS
+                    # FPS
                     dt = time.time() - t0
-                    self.fps_buffer.append(1 / dt if dt > 0 else 0)
-                    avg_fps = sum(self.fps_buffer) / len(self.fps_buffer)
+                    self.fps_buf.append(1 / dt if dt > 0 else 0)
+                    avg_fps = sum(self.fps_buf) / len(self.fps_buf)
                     
                     # Render
-                    output = self.hud.render(frame, detections, lanes, avg_fps)
+                    output = self.hud.render(frame, detections, lane_info, avg_fps, state)
                     
-                    # Save
                     if self.writer:
                         self.writer.write(output)
                     
-                    # Display
-                    cv2.imshow("AI Driving Assistant", output)
+                    cv2.imshow("AI Driving Assistant v9", output)
                 
-                # Handle keyboard
                 key = cv2.waitKey(1 if not paused else 100) & 0xFF
                 
                 if key == ord('q') or key == ord('Q'):
                     break
                 elif key == ord('r') or key == ord('R'):
                     self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    print("Video restarted")
+                    print("Restarted")
                 elif key == ord(' '):
                     paused = not paused
                     print("Paused" if paused else "Playing")
+                elif key == ord('s') or key == ord('S'):
+                    fname = f"screenshot_{int(time.time())}.png"
+                    cv2.imwrite(fname, output)
+                    print(f"Saved: {fname}")
         
         finally:
             self.cleanup()
     
     def cleanup(self):
-        """Release resources."""
         print("\nCleaning up...")
         if self.writer:
             self.writer.release()
@@ -1008,16 +1063,12 @@ class DrivingAssistant:
         print("  Done!\n")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#                              ENTRY POINT
-# ═══════════════════════════════════════════════════════════════════════════════
-
 if __name__ == "__main__":
     try:
         app = DrivingAssistant()
         app.run()
     except KeyboardInterrupt:
-        print("\n\nInterrupted by user")
+        print("\n\nInterrupted")
     except Exception as e:
         print(f"\nError: {e}")
         import traceback
