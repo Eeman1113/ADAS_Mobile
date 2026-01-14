@@ -487,36 +487,53 @@
     function analyzeScene(tracks, laneData) {
         let maxThreat = 0;
         let criticalObj = null;
+        let centerObj = null;
+        
         const w = canvas.width;
-        const h = canvas.height;
         const centerZone = w * 0.35; // Center 35%
         const centerX = w / 2;
+
+        // Reset positions map for passing logic
+        let leftClear = true;
+        let rightClear = true;
 
         tracks.forEach(t => {
             const [x, y, bw, bh] = t.bbox;
             const cx = x + bw/2;
-            const cy = y + bh/2;
             
             // Heuristic Distance
             const realW = CONFIG.WIDTHS[t.class] || 1.0;
-            // Estimated distance in meters (calibrated roughly for phone FOV)
             t.distance = (realW * 800) / bw; 
+
+            // Position Analysis
+            let pos = "CENTER";
+            if (cx < centerX - centerZone/2) pos = "LEFT";
+            else if (cx > centerX + centerZone/2) pos = "RIGHT";
+            
+            if (pos === "LEFT") leftClear = false;
+            if (pos === "RIGHT") rightClear = false;
 
             // Threat Logic
             let threat = 0;
-            const isCenter = Math.abs(cx - centerX) < centerZone;
             
-            if (isCenter) {
+            if (pos === "CENTER") {
                 if (t.distance < 15) threat = 4; // Critical
                 else if (t.distance < 30) threat = 3; // High
                 else if (t.distance < 50) threat = 2; // Medium
                 else threat = 1;
+                
+                // Track closest center object for passing logic
+                if (threat >= 2 && (!centerObj || t.distance < centerObj.distance)) {
+                    centerObj = t;
+                }
             } else {
                 if (t.distance < 10) threat = 2; // Close side object
             }
 
             // Pedestrian Boost
-            if (t.class === 'person' && threat > 0) threat = Math.min(4, threat + 1);
+            if (['person', 'dog', 'horse', 'sheep', 'cow'].includes(t.class) && threat > 0) {
+                threat = Math.min(4, threat + 1);
+            }
 
             t.threatLevel = threat;
             if (threat > maxThreat) {
@@ -525,37 +542,63 @@
             }
         });
 
-        // Lane Drift Logic
-        if (maxThreat < 3 && laneData.detected) {
+        // 1. Critical Logic (Collision Imminent)
+        if (maxThreat >= 4) {
+            if (['person', 'dog', 'horse', 'sheep', 'cow'].includes(criticalObj.class)) {
+                instruction = { 
+                    text: "⚠ STOP", 
+                    sub: `${criticalObj.label} ON ROAD!`, 
+                    color: COLORS.RED 
+                };
+            } else {
+                instruction = { 
+                    text: "⚠ BRAKE", 
+                    sub: `Collision Warning: ${criticalObj.label} (${criticalObj.distance.toFixed(0)}m)`, 
+                    color: COLORS.RED 
+                };
+            }
+            return;
+        }
+
+        // 2. High Threat (Approaching)
+        if (maxThreat === 3) {
+            instruction = { 
+                text: "SLOW DOWN", 
+                sub: `${criticalObj.label} Ahead (${criticalObj.distance.toFixed(0)}m)`, 
+                color: COLORS.ORANGE 
+            };
+            return;
+        }
+
+        // 3. Passing Logic (Medium Threat in Center)
+        if (centerObj && maxThreat === 2) {
+            if (rightClear) {
+                instruction = { text: "PASS RIGHT", sub: `Clear to overtake ${centerObj.label}`, color: COLORS.GREEN };
+            } else if (leftClear) {
+                instruction = { text: "PASS LEFT", sub: `Clear to overtake ${centerObj.label}`, color: COLORS.GREEN };
+            } else {
+                instruction = { text: "HOLD", sub: "Wait for opening", color: COLORS.YELLOW };
+            }
+            return;
+        }
+
+        // 4. Lane Drift Logic
+        if (laneData.detected) {
             if (laneData.offset < -0.3) {
-                instruction = { text: "DRIFTING LEFT", sub: "Correct Right", color: COLORS.YELLOW };
+                instruction = { text: "DRIFT LEFT", sub: "Steer Right to Correct", color: COLORS.YELLOW };
                 return;
             } else if (laneData.offset > 0.3) {
-                instruction = { text: "DRIFTING RIGHT", sub: "Correct Left", color: COLORS.YELLOW };
+                instruction = { text: "DRIFT RIGHT", sub: "Steer Left to Correct", color: COLORS.YELLOW };
                 return;
             }
         }
 
-        // Object Warning Logic
-        if (maxThreat >= 4) {
-            instruction = { 
-                text: "⚠ BRAKE", 
-                sub: `Collision Warning: ${criticalObj.label}`, 
-                color: COLORS.RED 
-            };
-        } else if (maxThreat === 3) {
-            instruction = { 
-                text: "SLOW DOWN", 
-                sub: `Approaching ${criticalObj.label}`, 
-                color: COLORS.ORANGE 
-            };
-        } else {
-            instruction = { 
-                text: "CLEAR", 
-                sub: `Tracking ${tracks.length} Objects`, 
-                color: COLORS.CYAN 
-            };
-        }
+        // 5. Default
+        instruction = { 
+            text: "CLEAR", 
+            sub: `Road ahead is clear`, 
+            color: COLORS.CYAN 
+        };
     }
 
     // --- Rendering ---
